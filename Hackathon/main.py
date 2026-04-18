@@ -9,17 +9,18 @@ from fastapi.middleware.cors import CORSMiddleware
 from pathlib import Path
 import nltk
 from nltk.tokenize import sent_tokenize
+
 nltk.download("punkt_tab", quiet=True)
 import json
 from langchain_openai import OpenAIEmbeddings
 from qdrant_client import QdrantClient
 from langchain_qdrant import QdrantVectorStore
 from qdrant_client.http.models import VectorParams, Distance
-from langchain_openai import ChatOpenAI
-from langchain_core.prompts import ChatPromptTemplate
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.decomposition import PCA
 import numpy as np
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
 class SearchRequest(BaseModel):
@@ -29,7 +30,36 @@ class SearchRequest(BaseModel):
 
 load_dotenv(Path(__file__).parent / ".env")
 
+# Load local model for attention visualization
+model_id_local = "mistralai/Mistral-7B-Instruct-v0.3"
+device = "mps" if torch.backends.mps.is_available() else "cpu"
+tokenizer = AutoTokenizer.from_pretrained(model_id_local)
+local_model = AutoModelForCausalLM.from_pretrained(
+    model_id_local,
+    torch_dtype=torch.float16 if device == "mps" else torch.float32,
+    attn_implementation="eager",
+).to(device)
+
 app = FastAPI()
+
+
+@app.get("/health/model")
+def health_model():
+    """Quick smoke test: feed one token through the local model."""
+    try:
+        test_ids = tokenizer.encode("hello", return_tensors="pt").to(device)
+        with torch.no_grad():
+            out = local_model(test_ids)
+        return {
+            "status": "ok",
+            "device": device,
+            "model": model_id_local,
+            "vocab_size": out.logits.shape[-1],
+        }
+    except Exception as e:
+        return {"status": "error", "detail": str(e)}
+
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -60,23 +90,6 @@ vectorstore = QdrantVectorStore(
     client=client,
     collection_name=collection_name,
     embedding=embeddings,
-)
-
-llm = ChatOpenAI(
-    model="gpt-4o",
-    openai_api_key=os.getenv("OPENAI_API_KEY"),
-)
-system_prompt = """
-You are a helpful assistant answering questions based on the following context.
-If the answer is not in the context, say you don't know.
-Context:
-{context}
-"""
-prompt = ChatPromptTemplate.from_messages(
-    [
-        ("system", system_prompt),
-        ("human", "{query}"),
-    ]
 )
 
 # Global state for chunks data (populated by /upload)
@@ -285,15 +298,33 @@ async def websocket_query(websocket: WebSocket):
             }
         )
 
-        chain = prompt | llm
-        response = chain.invoke({"context": context, "query": query})
+        # Generate answer with Mistral
+        msgs = [
+            {
+                "role": "system",
+                "content": f"Answer using the provided context. If unknown, say you don't know.\n\nContext:\n{context}",
+            },
+            {"role": "user", "content": query},
+        ]
+        input_ids = tokenizer.apply_chat_template(msgs, return_tensors="pt")
+        if not isinstance(input_ids, torch.Tensor):
+            input_ids = input_ids["input_ids"]
+        if input_ids.dim() == 1:
+            input_ids = input_ids.unsqueeze(0)
+        input_ids = input_ids.to(device)
+
+        with torch.no_grad():
+            output_ids = local_model.generate(input_ids, max_new_tokens=200)
+        # Decode only the new tokens (skip the prompt)
+        new_tokens = output_ids[0, input_ids.shape[1] :]
+        answer_text = tokenizer.decode(new_tokens, skip_special_tokens=True)
 
         await websocket.send_json(
             {
                 "event": "answer",
                 "data": {
                     "query": query,
-                    "answer": response.content,
+                    "answer": answer_text,
                     "sources": [
                         {"text": doc.page_content, "metadata": doc.metadata}
                         for doc in docs
@@ -368,3 +399,215 @@ def get_graph():
         "nodes": nodes,
         "edges": edges,
     }
+
+
+MAX_SEQ_LEN = 20
+MAX_NEW_TOKENS = 10
+
+
+def generate_with_attention(input_ids, max_new_tokens, queue, loop):
+    """Generate tokens one at a time, pushing attention matrices into a queue."""
+    eos_token_id = tokenizer.eos_token_id
+    current_ids = input_ids
+
+    with torch.no_grad():
+        for step in range(max_new_tokens):
+            outputs = local_model(current_ids, output_attentions=True)
+
+            # Pick next token
+            logits = outputs.logits[:, -1, :]
+            next_token_id = logits.argmax(dim=-1, keepdim=True)
+            next_token_str = tokenizer.decode(
+                next_token_id[0], skip_special_tokens=False
+            )
+
+            # Extract full attention: each layer is (1, num_heads, seq_len, seq_len)
+            # Only keep the last MAX_SEQ_LEN tokens' attention to stay bounded
+            seq_len = current_ids.shape[1]
+            start = max(0, seq_len - MAX_SEQ_LEN)
+
+            attention_grid = []
+            for layer_attn in outputs.attentions:
+                # Slice to last MAX_SEQ_LEN rows and cols
+                sliced = layer_attn[0, :, start:, start:]  # (num_heads, <=10, <=10)
+                heads = sliced.cpu().tolist()
+                attention_grid.append(heads)
+
+            # Get the token labels for the visible window
+            visible_ids = current_ids[0, start:]
+            visible_tokens = tokenizer.convert_ids_to_tokens(visible_ids)
+
+            asyncio.run_coroutine_threadsafe(
+                queue.put(
+                    {
+                        "step": step,
+                        "token": next_token_str,
+                        "tokens": visible_tokens,
+                        "seq_len": len(visible_tokens),
+                        "attention_grid": attention_grid,
+                    }
+                ),
+                loop,
+            )
+
+            current_ids = torch.cat([current_ids, next_token_id], dim=-1)
+            if next_token_id.item() == eos_token_id:
+                break
+
+    asyncio.run_coroutine_threadsafe(queue.put(None), loop)
+
+
+@app.websocket("/ws/attention")
+async def websocket_attention(websocket: WebSocket):
+    await websocket.accept()
+
+    try:
+        while True:
+            data = await websocket.receive_json()
+            query = data["query"]
+            k = data.get("k", 5)
+            max_tokens = data.get("max_tokens", MAX_NEW_TOKENS)
+
+            # 1. Retrieve context from vector store
+            docs = vectorstore.similarity_search(query, k=k)
+            context = "\n\n".join([doc.page_content for doc in docs])
+            source_chat_ids = [doc.metadata["chat_id"] for doc in docs]
+
+            # 2. Build and send graph data
+            collection = client.get_collection(collection_name)
+            points = client.scroll(
+                collection_name=collection_name,
+                limit=collection.points_count,
+                with_vectors=True,
+            )[0]
+
+            chat_id_to_vec = {}
+            for point in points:
+                chat_id = point.payload["metadata"]["chat_id"]
+                chat_id_to_vec[chat_id] = point.vector
+
+            ids_sorted = sorted(chat_id_to_vec.keys())
+            X = np.array([chat_id_to_vec[i] for i in ids_sorted])
+
+            sim_matrix = cosine_similarity(X)
+            threshold = 0.8
+            edges = []
+            for i in range(len(ids_sorted)):
+                for j in range(i + 1, len(ids_sorted)):
+                    if sim_matrix[i, j] > threshold:
+                        edges.append(
+                            {
+                                "source": f"chunk_{ids_sorted[i]}",
+                                "target": f"chunk_{ids_sorted[j]}",
+                            }
+                        )
+
+            pos_3d = get_3d_positions(X.tolist())
+
+            nodes = []
+            for i, chat_id in enumerate(ids_sorted):
+                text = next(
+                    (c["text"] for c in chunks_data if c["chat_id"] == chat_id), ""
+                )
+                label = text[:60] + "..." if len(text) > 60 else text
+                nodes.append(
+                    {
+                        "id": f"chunk_{chat_id}",
+                        "label": label,
+                        "text": text,
+                        "x": pos_3d[i]["x"],
+                        "y": pos_3d[i]["y"],
+                        "z": pos_3d[i]["z"],
+                        "is_source": chat_id in source_chat_ids,
+                    }
+                )
+
+            path = [f"chunk_{id}" for id in source_chat_ids]
+
+            await websocket.send_json(
+                {
+                    "event": "graph",
+                    "data": {
+                        "nodes": nodes,
+                        "edges": edges,
+                        "path": path,
+                        "sim_matrix": sim_matrix.tolist(),
+                    },
+                }
+            )
+
+            # 3. Tokenize prompt (truncate to MAX_SEQ_LEN for initial window)
+            msgs = [
+                {"role": "user", "content": f"{context}\n\n{query}"},
+            ]
+            input_ids = tokenizer.apply_chat_template(msgs, return_tensors="pt")
+            if not isinstance(input_ids, torch.Tensor):
+                input_ids = input_ids["input_ids"]
+            if input_ids.dim() == 1:
+                input_ids = input_ids.unsqueeze(0)
+            input_ids = input_ids[:, :MAX_SEQ_LEN].to(device)
+
+            num_layers = len(local_model.model.layers)
+            num_heads = local_model.config.num_attention_heads
+
+            prompt_tokens = tokenizer.convert_ids_to_tokens(input_ids[0])
+            await websocket.send_json(
+                {
+                    "event": "tokens",
+                    "data": {
+                        "prompt_tokens": prompt_tokens,
+                        "num_layers": num_layers,
+                        "num_heads": num_heads,
+                    },
+                }
+            )
+
+            # 4. Generate token-by-token, streaming attention live
+            queue = asyncio.Queue()
+            loop = asyncio.get_event_loop()
+
+            loop.run_in_executor(
+                None, generate_with_attention, input_ids, max_tokens, queue, loop
+            )
+
+            full_answer = []
+            while True:
+                item = await queue.get()
+                if item is None:
+                    break
+
+                full_answer.append(item["token"])
+
+                # Send live attention update — full 10x10 heatmap grid
+                await websocket.send_json(
+                    {
+                        "event": "attention",
+                        "data": {
+                            "step": item["step"],
+                            "token": item["token"],
+                            "tokens": item["tokens"],
+                            "seq_len": item["seq_len"],
+                            "num_layers": num_layers,
+                            "num_heads": num_heads,
+                            "attention_grid": item["attention_grid"],
+                        },
+                    }
+                )
+
+            # 5. Send final answer (assembled from generated tokens)
+            await websocket.send_json(
+                {
+                    "event": "answer",
+                    "data": {
+                        "query": query,
+                        "answer": "".join(full_answer).strip(),
+                        "sources": [
+                            {"text": doc.page_content, "metadata": doc.metadata}
+                            for doc in docs
+                        ],
+                    },
+                }
+            )
+
+    except WebSocketDisconnect:
+        pass
