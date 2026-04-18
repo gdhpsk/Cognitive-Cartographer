@@ -1,8 +1,11 @@
 'use client'
-import { useState, useRef, useCallback } from 'react';
+import { useState, useRef, useCallback, useEffect } from 'react';
 import Scene from '@/components/scene';
 import { useAppStore, generateRandomHex, type GraphData } from '@/helpers/store';
 import { FileUpload } from '@/components/file-upload';
+import { Slider } from '@/components/slider';
+
+const MIN_SCREEN_WIDTH = 1200;
 
 interface QuerySource {
   text: string;
@@ -12,11 +15,17 @@ interface QuerySource {
 export default function App() {
   const [queryText, setQueryText] = useState('');
   const [aiQuery, setAiQuery] = useState('');
+  const [aiK, setAiK] = useState(10);
   const [aiAnswer, setAiAnswer] = useState<string | null>(null);
   const [aiSources, setAiSources] = useState<QuerySource[]>([]);
   const [isQuerying, setIsQuerying] = useState(false);
+  const [uploadStatus, setUploadStatus] = useState<string>('');
+  const [isUploading, setIsUploading] = useState(false);
+  const [hasUploadedPdf, setHasUploadedPdf] = useState(false);
+  const [pendingUploadFile, setPendingUploadFile] = useState<File | null>(null);
+  const [isScreenWideEnough, setIsScreenWideEnough] = useState(true);
   const wsRef = useRef<WebSocket | null>(null);
-  const { nodes, edges, isLoading, setLoading, setActiveNodes, selectedNodeId, setSelectedNode, loadGraph } = useAppStore();
+  const { nodes, edges, isLoading, setLoading, setActiveNodes, setAiSourceNodes, selectedNodeId, setSelectedNode, loadGraph } = useAppStore();
 
   const handleAiQuery = useCallback(() => {
     if (!aiQuery.trim() || isQuerying) return;
@@ -24,11 +33,11 @@ export default function App() {
     setAiAnswer(null);
     setAiSources([]);
 
-    const ws = new WebSocket(`wss://graph.hpsk.me/ws/query`);
+    const ws = new WebSocket(`wss://${process.env.NEXT_PUBLIC_HOSTNAME}/ws/query`);
     wsRef.current = ws;
 
     ws.onopen = () => {
-      ws.send(JSON.stringify({ query: aiQuery.trim(), k: 5 }));
+      ws.send(JSON.stringify({ query: aiQuery.trim(), k: aiK }));
     };
 
     ws.onmessage = (event) => {
@@ -42,23 +51,24 @@ export default function App() {
 
         // Match sources to graph nodes and activate them
         const { nodes: currentNodes, edges: currentEdges } = useAppStore.getState();
-        const matchedIds = new Set<string>();
+        const sourceNodeIds = new Set<string>();
         for (const src of sources) {
           for (const node of currentNodes) {
             if (node.text === src.text) {
-              matchedIds.add(node.id);
+              sourceNodeIds.add(node.id);
               break;
             }
           }
         }
+        const matchedIds = new Set<string>(sourceNodeIds);
         // Include direct neighbors
         for (const edge of currentEdges) {
           if (matchedIds.has(edge.sourceId)) matchedIds.add(edge.targetId);
           if (matchedIds.has(edge.targetId)) matchedIds.add(edge.sourceId);
         }
-        if (matchedIds.size > 0) {
-          useAppStore.getState().setActiveNodes([...matchedIds]);
-        }
+        // Keep the full AI-answer cluster (sources + neighbors) pinned as active.
+        useAppStore.getState().setAiSourceNodes([...matchedIds]);
+        useAppStore.getState().setActiveNodes([...matchedIds]);
       }
     };
 
@@ -70,25 +80,21 @@ export default function App() {
     ws.onclose = () => {
       wsRef.current = null;
     };
-  }, [aiQuery, isQuerying]);
+  }, [aiK, aiQuery, isQuerying]);
 
-  const API_BASE = 'https://graph.hpsk.me';
+  const API_BASE = `https://${process.env.NEXT_PUBLIC_HOSTNAME}`;
 
-  const handleLoadGraph = async () => {
+  const handleLoadGraph = useCallback(async () => {
     setLoading(true);
     try {
       const res = await fetch(`${API_BASE}/graph`);
       const data: GraphData = await res.json();
-      const MAX_RADIUS = 7; // fit inside radius-8 sphere
       const graphNodes = data.nodes.map((n) => {
-        let x = n.x, y = n.y, z = n.z;
-        const mag = Math.sqrt(x * x + y * y + z * z);
-        const scale = mag > 0 ? Math.min(MAX_RADIUS, MAX_RADIUS * mag) / mag : 0;
         return {
           id: n.id,
           label: n.label,
           text: n.text || '',
-          position: [x * scale, y * scale, z * scale] as [number, number, number],
+          position: [n.x, n.y, n.z] as [number, number, number],
           color: generateRandomHex(),
         };
       });
@@ -102,7 +108,98 @@ export default function App() {
     } finally {
       setLoading(false);
     }
-  };
+  }, [loadGraph, setLoading]);
+
+  const handleUploadFileSelection = useCallback((files: File[]) => {
+    const file = files?.[0];
+    if (!file || isUploading) return;
+
+    setHasUploadedPdf(false);
+    setPendingUploadFile(file);
+    setUploadStatus(`Ready to upload: ${file.name}`);
+  }, [isUploading]);
+
+  const handleConfirmUpload = useCallback(() => {
+    if (!pendingUploadFile || isUploading) return;
+
+    setHasUploadedPdf(false);
+    setIsUploading(true);
+    setUploadStatus('Connecting to upload service...');
+
+    const uploadWs = new WebSocket(`wss://${process.env.NEXT_PUBLIC_HOSTNAME}/ws/upload`);
+
+    uploadWs.onopen = () => {
+      setUploadStatus('Connected. Uploading PDF bytes...');
+      uploadWs.send(pendingUploadFile);
+    };
+
+    uploadWs.onmessage = (msg) => {
+      try {
+        const parsed = JSON.parse(msg.data);
+        if (typeof parsed?.data === 'string') {
+          setUploadStatus(parsed.data);
+        }
+        if (parsed?.event === 'done') {
+          setHasUploadedPdf(true);
+          setPendingUploadFile(null);
+          setIsUploading(false);
+          void handleLoadGraph();
+          uploadWs.close();
+        }
+      } catch {
+        // Keep the raw message as a fallback status for non-JSON responses.
+        if (typeof msg.data === 'string') {
+          setUploadStatus(msg.data);
+        }
+      }
+    };
+
+    uploadWs.onerror = () => {
+      setUploadStatus('Upload failed. Check that ws://localhost:8000 is running.');
+      setHasUploadedPdf(false);
+      setIsUploading(false);
+    };
+
+    uploadWs.onclose = () => {
+      setIsUploading(false);
+    };
+  }, [handleLoadGraph, isUploading, pendingUploadFile]);
+
+  useEffect(() => {
+    const checkViewportWidth = () => {
+      setIsScreenWideEnough(window.innerWidth >= MIN_SCREEN_WIDTH);
+    };
+
+    checkViewportWidth();
+    window.addEventListener('resize', checkViewportWidth);
+    return () => window.removeEventListener('resize', checkViewportWidth);
+  }, []);
+
+  if (!isScreenWideEnough) {
+    return (
+      <div
+        style={{
+          width: '100vw',
+          height: '100vh',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          background: '#050510',
+          color: 'white',
+          fontFamily: 'sans-serif',
+          padding: '24px',
+          textAlign: 'center',
+        }}
+      >
+        <div>
+          <h1 style={{ margin: '0 0 12px', fontSize: '28px' }}>Wider Screen Required</h1>
+          <p style={{ margin: 0, opacity: 0.8, fontSize: '16px' }}>
+            This experience requires a minimum width of {MIN_SCREEN_WIDTH}px.
+          </p>
+        </div>
+      </div>
+    );
+  }
 
   return (
     // Main Wrapper
@@ -132,149 +229,218 @@ export default function App() {
             AI Data Visualizer
           </h1>
           <p style={{ opacity: 0.7 }}>Rotate to explore the latent space.</p>
+          <p style={{ opacity: 0.9, fontSize: '12px', marginTop: '6px' }}>Nodes in scene: {nodes.length}</p>
         </header>
 
         {/* Bottom Control Panel */}
-        <div style={{ display: 'flex', justifyContent: 'center' }}>
-          <FileUpload></FileUpload>
-        </div>
-        <div style={{ display: 'flex', justifyContent: 'center' }}>
+        <div
+          style={{
+            display: 'flex',
+            justifyContent: 'space-between',
+            alignItems: 'flex-end',
+            gap: '16px',
+            flexWrap: 'wrap',
+          }}
+        >
           <div
             style={{
               pointerEvents: 'auto',
+              width: 'min(360px, 100%)',
               background: 'rgba(20, 20, 30, 0.8)',
               backdropFilter: 'blur(10px)',
-              padding: '16px',
+              padding: '12px',
               borderRadius: '12px',
-              display: 'flex',
-              gap: '12px',
-              border: '1px solid rgba(255,255,255,0.1)'
+              border: '1px solid rgba(255,255,255,0.1)',
+              overflow: 'hidden',
             }}
           >
-            <button
-              type="button"
-              disabled={isLoading}
-              onClick={handleLoadGraph}
+            <FileUpload className="p-4" onChange={handleUploadFileSelection} />
+            <div
               style={{
-                padding: '10px 20px',
-                borderRadius: '6px',
-                border: 'none',
-                background: isLoading ? '#555' : 'cyan',
-                color: isLoading ? '#aaa' : 'black',
-                fontWeight: 'bold',
-                cursor: isLoading ? 'not-allowed' : 'pointer'
+                marginTop: '8px',
+                padding: '0 8px 8px',
+                color: 'white',
+                opacity: 0.8,
+                fontSize: '12px',
+                minHeight: '18px',
               }}
             >
-              {isLoading ? 'Loading...' : 'Load Graph'}
-            </button>
+              {isUploading ? `Uploading: ${uploadStatus}` : uploadStatus}
+            </div>
+            <div style={{ padding: '0 8px 8px' }}>
+              <button
+                type="button"
+                onClick={handleConfirmUpload}
+                disabled={isUploading || !pendingUploadFile}
+                style={{
+                  width: '100%',
+                  padding: '10px 12px',
+                  borderRadius: '6px',
+                  border: 'none',
+                  background: isUploading || !pendingUploadFile ? '#555' : '#22c55e',
+                  color: isUploading || !pendingUploadFile ? '#aaa' : 'white',
+                  fontWeight: 'bold',
+                  cursor: isUploading || !pendingUploadFile ? 'not-allowed' : 'pointer',
+                }}
+              >
+                {isUploading ? 'Uploading...' : 'Confirm Upload'}
+              </button>
+            </div>
           </div>
-          <form
-            onSubmit={(e) => {
-              e.preventDefault();
-              if (!queryText) return;
-              const { nodes: currentNodes, edges: currentEdges } = useAppStore.getState();
-              const query = queryText.toLowerCase();
-              const matched = currentNodes.filter((n) =>
-                n.label.toLowerCase().includes(query) || n.text.toLowerCase().includes(query)
-              );
-              if (matched.length === 0) {
-                setActiveNodes([]);
-                return;
-              }
-              const matchedIds = new Set(matched.map((n) => n.id));
-              for (const edge of currentEdges) {
-                if (matchedIds.has(edge.sourceId)) matchedIds.add(edge.targetId);
-                if (matchedIds.has(edge.targetId)) matchedIds.add(edge.sourceId);
-              }
-              setActiveNodes([...matchedIds]);
-            }}
-            style={{
-              pointerEvents: 'auto',
-              background: 'rgba(20, 20, 30, 0.8)',
-              backdropFilter: 'blur(10px)',
-              padding: '16px',
-              borderRadius: '12px',
-              display: 'flex',
-              gap: '12px',
-              border: '1px solid rgba(255,255,255,0.1)'
-            }}
-          >
-            <input
-              type="text"
-              placeholder="Search nodes..."
-              value={queryText}
-              onChange={(e) => setQueryText(e.target.value)}
+
+          <div style={{ display: 'flex', gap: '12px', flexWrap: 'wrap', justifyContent: 'center' }}>
+            <div
               style={{
-                width: '200px',
-                padding: '10px',
-                borderRadius: '6px',
-                border: 'none',
-                background: 'rgba(0,0,0,0.5)',
-                color: 'white'
-              }}
-            />
-            <button
-              type="submit"
-              disabled={nodes.length === 0}
-              style={{
-                padding: '10px 20px',
-                borderRadius: '6px',
-                border: 'none',
-                background: nodes.length === 0 ? '#555' : '#ff6b00',
-                color: nodes.length === 0 ? '#aaa' : 'white',
-                fontWeight: 'bold',
-                cursor: nodes.length === 0 ? 'not-allowed' : 'pointer'
+                pointerEvents: 'auto',
+                background: 'rgba(20, 20, 30, 0.8)',
+                backdropFilter: 'blur(10px)',
+                padding: '16px',
+                borderRadius: '12px',
+                display: 'flex',
+                gap: '12px',
+                border: '1px solid rgba(255,255,255,0.1)'
               }}
             >
-              Search
-            </button>
-          </form>
-          <form
-            onSubmit={(e) => {
-              e.preventDefault();
-              handleAiQuery();
-            }}
-            style={{
-              pointerEvents: 'auto',
-              background: 'rgba(20, 20, 30, 0.8)',
-              backdropFilter: 'blur(10px)',
-              padding: '16px',
-              borderRadius: '12px',
-              display: 'flex',
-              gap: '12px',
-              border: '1px solid rgba(255,255,255,0.1)'
-            }}
-          >
-            <input
-              type="text"
-              placeholder="Ask a question..."
-              value={aiQuery}
-              onChange={(e) => setAiQuery(e.target.value)}
-              style={{
-                width: '250px',
-                padding: '10px',
-                borderRadius: '6px',
-                border: 'none',
-                background: 'rgba(0,0,0,0.5)',
-                color: 'white'
+              <button
+                type="button"
+                disabled={isLoading || isUploading || !hasUploadedPdf}
+                onClick={handleLoadGraph}
+                style={{
+                  padding: '10px 20px',
+                  borderRadius: '6px',
+                  border: 'none',
+                  background: isLoading || isUploading || !hasUploadedPdf ? '#555' : 'cyan',
+                  color: isLoading || isUploading || !hasUploadedPdf ? '#aaa' : 'black',
+                  fontWeight: 'bold',
+                  cursor: isLoading || isUploading || !hasUploadedPdf ? 'not-allowed' : 'pointer'
+                }}
+              >
+                {isLoading ? 'Loading...' : 'Load Graph'}
+              </button>
+            </div>
+            <form
+              onSubmit={(e) => {
+                e.preventDefault();
+                if (!queryText) return;
+                const { nodes: currentNodes, edges: currentEdges } = useAppStore.getState();
+                const query = queryText.toLowerCase();
+                const matched = currentNodes.filter((n) =>
+                  n.label.toLowerCase().includes(query) || n.text.toLowerCase().includes(query)
+                );
+                if (matched.length === 0) {
+                  setActiveNodes([]);
+                  return;
+                }
+                const matchedIds = new Set(matched.map((n) => n.id));
+                for (const edge of currentEdges) {
+                  if (matchedIds.has(edge.sourceId)) matchedIds.add(edge.targetId);
+                  if (matchedIds.has(edge.targetId)) matchedIds.add(edge.sourceId);
+                }
+                setActiveNodes([...matchedIds]);
               }}
-            />
-            <button
-              type="submit"
-              disabled={isQuerying || !aiQuery.trim()}
               style={{
-                padding: '10px 20px',
-                borderRadius: '6px',
-                border: 'none',
-                background: isQuerying || !aiQuery.trim() ? '#555' : '#a855f7',
-                color: isQuerying || !aiQuery.trim() ? '#aaa' : 'white',
-                fontWeight: 'bold',
-                cursor: isQuerying || !aiQuery.trim() ? 'not-allowed' : 'pointer'
+                pointerEvents: 'auto',
+                background: 'rgba(20, 20, 30, 0.8)',
+                backdropFilter: 'blur(10px)',
+                padding: '16px',
+                borderRadius: '12px',
+                display: 'flex',
+                gap: '12px',
+                border: '1px solid rgba(255,255,255,0.1)'
               }}
             >
-              {isQuerying ? 'Thinking...' : 'Ask AI'}
-            </button>
-          </form>
+              <input
+                type="text"
+                placeholder="Search nodes..."
+                value={queryText}
+                onChange={(e) => setQueryText(e.target.value)}
+                style={{
+                  width: '200px',
+                  padding: '10px',
+                  borderRadius: '6px',
+                  border: 'none',
+                  background: 'rgba(0,0,0,0.5)',
+                  color: 'white'
+                }}
+              />
+              <button
+                type="submit"
+                disabled={nodes.length === 0}
+                style={{
+                  padding: '10px 20px',
+                  borderRadius: '6px',
+                  border: 'none',
+                  background: nodes.length === 0 ? '#555' : '#ff6b00',
+                  color: nodes.length === 0 ? '#aaa' : 'white',
+                  fontWeight: 'bold',
+                  cursor: nodes.length === 0 ? 'not-allowed' : 'pointer'
+                }}
+              >
+                Search
+              </button>
+            </form>
+            <form
+              onSubmit={(e) => {
+                e.preventDefault();
+                handleAiQuery();
+              }}
+              style={{
+                pointerEvents: 'auto',
+                background: 'rgba(20, 20, 30, 0.8)',
+                backdropFilter: 'blur(10px)',
+                padding: '16px',
+                borderRadius: '12px',
+                display: 'flex',
+                gap: '12px',
+                border: '1px solid rgba(255,255,255,0.1)'
+              }}
+            >
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                <input
+                  type="text"
+                  placeholder="Ask a question..."
+                  value={aiQuery}
+                  onChange={(e) => setAiQuery(e.target.value)}
+                  style={{
+                    width: '250px',
+                    padding: '10px',
+                    borderRadius: '6px',
+                    border: 'none',
+                    background: 'rgba(0,0,0,0.5)',
+                    color: 'white'
+                  }}
+                />
+                <div style={{ color: 'white', fontSize: '12px', opacity: 0.8 }}>
+                  Context size (k): {aiK}
+                </div>
+                <Slider
+                  min={5}
+                  max={20}
+                  step={1}
+                  value={[aiK]}
+                  onValueChange={(values) => {
+                    const next = values[0];
+                    if (typeof next === 'number') setAiK(next);
+                  }}
+                />
+              </div>
+              <button
+                type="submit"
+                disabled={isQuerying || !aiQuery.trim()}
+                style={{
+                  padding: '10px 20px',
+                  borderRadius: '6px',
+                  border: 'none',
+                  background: isQuerying || !aiQuery.trim() ? '#555' : '#a855f7',
+                  color: isQuerying || !aiQuery.trim() ? '#aaa' : 'white',
+                  fontWeight: 'bold',
+                  cursor: isQuerying || !aiQuery.trim() ? 'not-allowed' : 'pointer'
+                }}
+              >
+                {isQuerying ? 'Thinking...' : 'Ask AI'}
+              </button>
+            </form>
+          </div>
         </div>
       </div>
 
@@ -300,7 +466,12 @@ export default function App() {
           }}
         >
           <button
-            onClick={() => { setAiAnswer(null); setAiSources([]); setActiveNodes([]); }}
+            onClick={() => {
+              setAiAnswer(null);
+              setAiSources([]);
+              setAiSourceNodes([]);
+              setActiveNodes([]);
+            }}
             style={{
               position: 'absolute',
               top: '10px',
@@ -334,7 +505,17 @@ export default function App() {
                   <div
                     key={i}
                     onClick={() => {
-                      if (matchedNode) setSelectedNode(matchedNode.id);
+                      if (matchedNode) {
+                        const clusterIds = new Set<string>([matchedNode.id]);
+                        for (const edge of edges) {
+                          if (edge.sourceId === matchedNode.id) clusterIds.add(edge.targetId);
+                          if (edge.targetId === matchedNode.id) clusterIds.add(edge.sourceId);
+                        }
+                        const { activeNodeIds } = useAppStore.getState();
+                        const mergedIds = new Set<string>([...activeNodeIds, ...clusterIds]);
+                        setActiveNodes([...mergedIds]);
+                        setSelectedNode(matchedNode.id);
+                      }
                     }}
                     style={{
                       background: 'rgba(255,255,255,0.05)',
@@ -409,7 +590,10 @@ export default function App() {
             {isOpen && (
               <>
                 <button
-                  onClick={() => setSelectedNode(null)}
+                  onClick={() => {
+                    setSelectedNode(null);
+                    setActiveNodes([]);
+                  }}
                   style={{
                     position: 'absolute',
                     top: '12px',

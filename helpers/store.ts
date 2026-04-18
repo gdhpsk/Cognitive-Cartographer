@@ -42,11 +42,13 @@ interface AppState {
   edges: EdgeData[];
   isLoading: boolean;
   activeNodeIds: Set<string>;
+  aiSourceNodeIds: Set<string>;
   selectedNodeId: string | null;
   addNode: (label: string, position: [number, number, number], text?: string) => string;
   addEdge: (sourceId: string, targetId: string) => void;
   setLoading: (status: boolean) => void;
   setActiveNodes: (ids: string[]) => void;
+  setAiSourceNodes: (ids: string[]) => void;
   setSelectedNode: (id: string | null) => void;
   loadGraph: (nodes: NodeData[], edges: EdgeData[]) => void;
 }
@@ -58,6 +60,7 @@ export const useAppStore = create<AppState>((set) => ({
   edges: [],
   isLoading: false,
   activeNodeIds: new Set<string>(),
+  aiSourceNodeIds: new Set<string>(),
 
   addNode: (label, position, text = '') => {
     const id = Math.random().toString();
@@ -71,8 +74,18 @@ export const useAppStore = create<AppState>((set) => ({
     edges: [...state.edges, { sourceId, targetId }]
   })),
   selectedNodeId: null,
-  setActiveNodes: (ids) => set({ activeNodeIds: new Set(ids) }),
+  setActiveNodes: (ids) => set((state) => ({
+    activeNodeIds: new Set([...state.aiSourceNodeIds, ...ids])
+  })),
+  setAiSourceNodes: (ids) => set((state) => {
+    const nextAiSourceNodeIds = new Set(ids);
+    const nonSourceActiveIds = [...state.activeNodeIds].filter((id) => !state.aiSourceNodeIds.has(id));
+    return {
+      aiSourceNodeIds: nextAiSourceNodeIds,
+      activeNodeIds: new Set([...nextAiSourceNodeIds, ...nonSourceActiveIds]),
+    };
+  }),
   setSelectedNode: (id) => set({ selectedNodeId: id }),
-  loadGraph: (nodes, edges) => set({ nodes, edges, activeNodeIds: new Set(), selectedNodeId: null }),
+  loadGraph: (nodes, edges) => set({ nodes, edges, activeNodeIds: new Set(), aiSourceNodeIds: new Set(), selectedNodeId: null }),
   setLoading: (status) => set({ isLoading: status })
 }));
