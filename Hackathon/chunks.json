@@ -1,0 +1,132 @@
+[
+  {
+    "chat_id": 0,
+    "text": "Auto-Select Reading Passages in English Assessment Tests?\nBruce W. Lee1,2\nUniversity of Pennsylvania1\nbrucelws@seas.upenn.edu\nJason Hyung-Jong Lee2\nLXPER AI Research2\njasonlee@lxper.com\nAbstract\nWe show a method to auto-select reading pas-\nsages in English assessment tests and share\nsome key insights that can be helpful in re-\nlated \ufb01elds. In speci\ufb01cs, we prove that \ufb01nding\na similar passage (to a passage that already ap-\npeared in the test) can give a suitable passage\nfor test development. In the process, we create\na simple database-tagger-\ufb01lter algorithm and\nperform a human evaluation. However, 1. the\ntextual features, that we analyzed, lack cover-\nage, and 2.\nwe fail to \ufb01nd meaningful cor-\nrelations between each feature and suitability\nscore. Lastly, we describe the future develop-\nments to improve automated reading passage\nselection.\n1\nIntroduction\n1.1\nWhy Important?\nNot all reading materials apply the same. Depend-\ning on how the reading material is presented to",
+    "length": 980
+  },
+  {
+    "chat_id": 1,
+    "text": "selection.\n1\nIntroduction\n1.1\nWhy Important?\nNot all reading materials apply the same. Depend-\ning on how the reading material is presented to\nlanguage learners, generally good reading mate-\nrial might not be as appropriate in more speci\ufb01c\ncontexts. In this paper, we investigate if automatic\nreading passage selection is a feasible task in test-\nbased contexts.\nThough not many, some studies (Kuo et al.,\n2014; Hsu et al., 2010) attempted to devise a read-\ning material recommendation system to give gen-\nerally helpful texts to students. Such systems at-\ntempt to give what is helpful to each user, based\non one\u2019s performance record. However, most En-\nglish assessment exams (SAT, TOEFL, TOEIC) are\nstandardized, presenting some unique challenges.\nChoosing appropriate passages for reading com-\nprehension sections of such exams is a lengthy\nprocess. SAT, a standardized test widely used for\ncollege admissions in the United States (Westrick\net al., 2019), has lengthy technical speci\ufb01cations",
+    "length": 994
+  },
+  {
+    "chat_id": 2,
+    "text": "college admissions in the United States (Westrick\net al., 2019), has lengthy technical speci\ufb01cations\nfor test development, which include three steps: 1.\nitem search/crafting, 2. content and fairness review,\n3. pretesting (College-Board, 2017). Each step\nrequires further technical training of already pro-\nfessionals, making test development troublesome.\nThe 1. test-speci\ufb01c technicalities merge with\nthe 2. test developer\u2019s expertise to select suitable\nreading passages. Intuitively speaking, both com-\nponents are dif\ufb01cult to mimic even with the re-\ncent natural language processing (NLP) techniques.\nHence, automatic reading passage selection for test\npapers has largely been left in the dark. But the\ntopic is worthy enough of investigation.\nFaster reading passage selection is de\ufb01nitely use-\nful as it enables cheaper testing, diverse variations\nof test papers, better student preparation, etc. But\nwould deeper research produce a usable passage\nselection system for tests? We try to answer.",
+    "length": 996
+  },
+  {
+    "chat_id": 3,
+    "text": "of test papers, better student preparation, etc. But\nwould deeper research produce a usable passage\nselection system for tests? We try to answer.\n1.2\nFind Alike, not Find Again\nWe propose a multi-aspect text similarity search\non a gold instance, instead of a bottom-up recom-\nmendation algorithm. A gold instance is a reading\npassage that has already appeared in previous test\npapers. Therefore, a gold instance has already gone\nthrough a standard passage selection procedure.\nBy searching for a text similar to the gold in-\nstance, instead of mimicking the full selection pro-\ncedure, we can utilize the textual properties of the\ngold and skip steps dif\ufb01cult to imitate.\nWe need a multi-aspect text similarity search be-\ncause the textual properties that make a passage\nappropriate are manifold (College-Board, 2017;\nEducational-Testing-Service, 2010). Though previ-\nous text similarity studies mostly focus on seman-\ntic similarity (Prakoso et al., 2021; Gomaa et al.,",
+    "length": 970
+  },
+  {
+    "chat_id": 4,
+    "text": "ous text similarity studies mostly focus on seman-\ntic similarity (Prakoso et al., 2021; Gomaa et al.,\n2013), we need to expand the scope to surface-level\nproperties, lexical dif\ufb01culty, etc.\n1.3\nCollege Scholastic Ability Test (CSAT)\nCSAT tests the ability to study in college, based\non South Korea\u2019s high-school curriculum (KICE,\n2014). Around 500,000 Korean students take the\ntest every year. English is a required subject, and it\narXiv:2205.06961v1  [cs.CL]  14 May 2022",
+    "length": 473
+  },
+  {
+    "chat_id": 5,
+    "text": "--- PAGE BREAK -'--\nFigure 1: Our system. Each color is a unique passage.\nputs much focus on reading comprehension. Each\ntest paper has more than 20 reading passages taken\nfrom high-quality, previously published sources.\nWe take CSAT as a running example.\n2\nModel Description\n2.1\nOverview\nOur proposed system consists of three main com-\nponents: 1. database, 2. extractor, 3. \ufb01lter. A\ndatabase is a collection of stand-alone passages.\nThe database is an arbitrary concept; it could be a\ngold instance\u2019s original published source (consid-\nering a gold is an excerpt), the ACL Anthology, or\neven the whole internet. Developing a database is\nanalogous to setting the system\u2019s sensible search\nrange. The passages in a database are run through\nextractors to give numerical representations of tex-\ntual features.\nExtractors are a collection of multiple single fea-\nture extractors. Some examples are a word per\nsentence extractor and a semantic encoding extrac-",
+    "length": 955
+  },
+  {
+    "chat_id": 6,
+    "text": "Extractors are a collection of multiple single fea-\nture extractors. Some examples are a word per\nsentence extractor and a semantic encoding extrac-\ntor. The numerical features (integer, \ufb02oat, or multi-\nple numeric sequences), are then concatenated to\nthe original passages to be saved in the database,\nawaiting for a gold instance to be passed.\nWhen a gold instance1 enters the system (Figure\n1), it is \ufb01rst run through the same set of extractors\n(but not saved in the database). Then, the whole\ndatabase goes through multiple \ufb01lters to abandon\ndissimilar passages. The \ufb01lters have pass condi-\ntions that compare the corresponding features be-\ntween the database passages and gold instance\u2019s to\nselect a passage appropriate to replace gold.\n1In this paper, \"instance\" is used analogously to \"passage\".\nProperties\n#Instance\n#Sent\n#Word\n#Char\n#Diff\ntotal\n1,044\n10,651\n2.2e5\n1.4e6\n23,792\nmean\nN/A\n10.2\n215\n1,339\n22.8\nQ4 (max)\nN/A\n37\n431\n2,802\n70\nQ3\nN/A\n12\n254\n1,588\n28\nQ2 (median)\nN/A\n10\n212\n1,322\n22",
+    "length": 998
+  },
+  {
+    "chat_id": 7,
+    "text": "1,044\n10,651\n2.2e5\n1.4e6\n23,792\nmean\nN/A\n10.2\n215\n1,339\n22.8\nQ4 (max)\nN/A\n37\n431\n2,802\n70\nQ3\nN/A\n12\n254\n1,588\n28\nQ2 (median)\nN/A\n10\n212\n1,322\n22\nQ1\nN/A\n7\n173\n1,078\n16\nmin\nN/A\n1\n7\n42\n0\nTable 1: Database statistics. #: number of. diff: words\nthat only appear grade 9 and above.\n2.2\nDatabase\nOur database is a collection of instances, mostly\na single paragraph, like in CSAT. All past CSAT\nEnglish subject papers are publicly available2.\nWe take the test papers between 2021-2022; we\nsearched the source articles.\nWe used optical character recognition (OCR)\nthrough Google Vision API on the retrieved source\narticles\u2019 image \ufb01les. We manually divided the re-\nsult into paragraphs but we did not perform any\ninspection on the appropriateness of each item. We\nonly went through basic preprocessing procedures.\nThe database distribution is described in Table 1.\nThe preprocessing steps are:\n1. remove repeating whitespace characters\n2. remove sentences of lengths under 10 characters",
+    "length": 976
+  },
+  {
+    "chat_id": 8,
+    "text": "The preprocessing steps are:\n1. remove repeating whitespace characters\n2. remove sentences of lengths under 10 characters\n3. remove passages of lengths under 30 characters.\n2.3\nExtractor\nThen, we develop a series of extractors. The \ufb01rst\nis sentence-word counter using en_core_web_sm\nmodel pipeline from spaCy v.3.2.1 (Honnibal and\nMontani, 2017). We pass in each passage into\na spaCy object and count items in the resulting\ntoken list and sentence list. Usages are publicly\navailable3.\nSecond, we implement a lexical dif\ufb01culty extrac-\ntor using the Word Corpus of the Korean ELT cur-\nriculum (CoKEC-word) from Lee and Lee (2020).\nThe dataset classi\ufb01es 30608 words in 6 levels, with\neach corresponding to a speci\ufb01c grade range (A:\nsuitable for grade 1 to 4 students, B: grade 5 to 8\nstudents, C: grade 8 to 9 students, D: grade 9 to 11\nstudents, E: grade 11 to 12 students, F: college).\nLast, we implement semantic embeddings ex-\ntractor using SBERT-based framework (Reimers",
+    "length": 973
+  },
+  {
+    "chat_id": 9,
+    "text": "students, E: grade 11 to 12 students, F: college).\nLast, we implement semantic embeddings ex-\ntractor using SBERT-based framework (Reimers\nand Gurevych, 2019). From the authors\u2019 sentence-\ntransformers library, we utilize the recommended\nmodel (all-MiniLM-L6-v2) (Wang et al., 2020).\n2www.kice.re.kr\n3spacy.io/usage/spacy-101",
+    "length": 324
+  },
+  {
+    "chat_id": 10,
+    "text": "--- PAGE BREAK -'--\nGold\n#Sent\nWPS\nH_diff\nHPW\nSem. Similar\n#Output\n1\n2\n10\n0\n0.1\n0.35\n9\n2\n2\n10\n0\n0.1\n0.35\n7\n3\n2\n10\n0\n0.1\n0.37\n5\n4\n4\n10\n1\n0.05\n0.35\n5\n5\n4\n10\n0\n0.05\n0.35\n5\n6\n4\n10\n0\n0.05\n0.33\n5\n7\n2\n10\n0\n0.05\n0.22\n6\n8\n2\n10\n0\n0.05\n0.22\n6\n9\n2\n10\n0\n0.05\n0.35\n5\n10\n2\n10\n0\n0.05\n0.33\n6\nTable 2: Parameters \u03b1 set for each gold instance.\n2.4\nFilter\nA \ufb01lter is a function of some data and a condition\n(\ufb01ltered data = \ufb01lter(data, condition)). Whereas\na condition is a function of a gold instance, a\ndatabase instance, and a parameter \u03b1 (pass/fail =\ncondition(gold instance, DB instance, parameter)).\nCombining multiple \ufb01lters in a sequence reduces\nthe original database multiple times to leave only\nthe passages that pass all conditions under given\nparameters. Below are the \ufb01ve conditions we use,\nin a consecutive manner from top to bottom.\nSentence count condition:\nG\u2019s #Sent \u2212\u03b1 \u2264D\u2019s #Sent \u2264G\u2019s #Sent + \u03b1\nWord per sentence condition:\nG\u2019s WPS \u2212\u03b1 \u2264D\u2019s WPS \u2264G\u2019s WPS + \u03b1\nMax word dif\ufb01culty condition:",
+    "length": 983
+  },
+  {
+    "chat_id": 11,
+    "text": "G\u2019s #Sent \u2212\u03b1 \u2264D\u2019s #Sent \u2264G\u2019s #Sent + \u03b1\nWord per sentence condition:\nG\u2019s WPS \u2212\u03b1 \u2264D\u2019s WPS \u2264G\u2019s WPS + \u03b1\nMax word dif\ufb01culty condition:\nG\u2019s H_diff \u2212\u03b1 \u2264D\u2019s H_diff \u2264G\u2019s H_diff + \u03b1\nDif\ufb01cult word per all word condition:\nG\u2019s HPW \u2212\u03b1 \u2264D\u2019s HPW \u2264G\u2019s HPW + \u03b1\nSemantic similarity condition:\n\u03b1 \u2264G and D\u2019s Semantic Similarity\nFor the above conditions, #Sent: number of sen-\ntences, WPS: #word per sentence, H_diff: highest\nword dif\ufb01culty, HPW: #high dif\ufb01culty word (grade\n9 and above) per word. \u03b1 is the parameter that sets\nthe range. Semantic similarity is calculated through\nthe cosine distance between gold instance\u2019s (G) se-\nmantic encoding and database instance\u2019s (D).\n3\nEvaluation\n3.1\nTest Arrangement\nWe randomly selected 10 gold instances from\nCSAT papers between 2021 and 2022. Since all\nCSAT reading passages are of similar lengths, the\nselected passages ranged from 134 to 181 words.\nGold\nP Score\nPearon Correlation\nDummy\nFiltered\n\u2206\n#Word\n#Sent\nCEFR\n1\n13\n17\n+4\n0.102\n-0.0396\n\u223c0\n2\n11\n16\n+5\n-0.111\n0.360\n\u223c0\n3",
+    "length": 999
+  },
+  {
+    "chat_id": 12,
+    "text": "Gold\nP Score\nPearon Correlation\nDummy\nFiltered\n\u2206\n#Word\n#Sent\nCEFR\n1\n13\n17\n+4\n0.102\n-0.0396\n\u223c0\n2\n11\n16\n+5\n-0.111\n0.360\n\u223c0\n3\n12\n15\n+3\n-0.336\n-0.859\n\u223c0\n4\n9\n15\n+6\n0.0406\n-0.339\n\u223c0\n5\n9\n13\n+4\n0.0922\n0.545\n\u223c0\n6\n15\n18\n+3\n-0.415\n-0.439\n\u223c0\n7\n12\n17\n+5\n-0.105\n0.338\n\u223c0\n8\n16\n13\n-3\n-0.057\n0.084\n\u223c0\n9\n20\n14\n-6\n0.0707\n0.0991\n\u223c0\n10\n11\n17\n+6\n-0.143\n-0.0869\n\u223c0\nAverage\n12.8\n15.5\n+2.7\n-0.0862\n-0.0337\n\u223c0\nTable 3: Test results, in terms of score and correlation.\nFrom our database (Section 2.2), we ran the con-\nditions (Section 2.4) to obtain 5 candidate reading\npassages for each gold instance.\nThe parameters we set for each condition are\ndescribed in Table 2. These conditions are manu-\nally \ufb01ne-adjusted to make the resulting number of\ninstances as close to 5. As shown in the #Output\ncolumn, it sometimes seemed impossible to give\nthe desired #Output. This is due to the statistical\ndistribution of the respective features in database.\nThe 5 instances that passed our conditions were",
+    "length": 968
+  },
+  {
+    "chat_id": 13,
+    "text": "distribution of the respective features in database.\nThe 5 instances that passed our conditions were\nconcatenated to 5 dummy instances, from the same\ndatabase but completely randomly selected. The 10\ninstances were shuf\ufb02ed for anonymity. Ultimately,\nwe obtained 100 candidate instances along with 10\ngold instances.\nWe presented the test set to 2 EFL teachers in\nSouth Korea, each with over 10 years of experience,\nand 1 South Korean EFL student who took CSAT\nin 2020. All 3 test subjects are employees in EFL\neducational \ufb01rms or institutions.\nFor each trial, 10 candidate instances were\nshown along with the corresponding gold instance.\nThe test subjects were asked to give suitability\nscores on a 5-point scale. Our question was \"Is\nthe candidate instance suitable as a CSAT reading\npassage?\" They were also asked to give reasons as\nto why they gave the score.\n3.2\nAnalysis & Key Insights\nWe are interested in seeing if the \ufb01ltered instances\nscore meaningfully higher than the dummy in-",
+    "length": 988
+  },
+  {
+    "chat_id": 14,
+    "text": "3.2\nAnalysis & Key Insights\nWe are interested in seeing if the \ufb01ltered instances\nscore meaningfully higher than the dummy in-\nstances. Table 3 shows the result score sums and\ncorrelations of the test outlined in Section 3.1.\nThe Common European Framework of Reference\n(CEFR) levels is classi\ufb01ed with the RoBERTa-RF-\nT1 model, retrieved from Lee et al. (2021). The\nmodel is state-of-the-art and gives 76.3% accuracy\non the Cambridge dataset (Xia et al., 2016).",
+    "length": 459
+  },
+  {
+    "chat_id": 15,
+    "text": "--- PAGE BREAK -'--\n1. Multi-aspect similarity search gives mean-\ningful statistical improvement from random se-\nlection. The \ufb01ltered passages triumphed dummy\npassages in terms of suitability as a CSAT reading\npassage. This is an interesting phenomenon as the\n\ufb01lters were not set to directly measure suitability.\nRather, they measure similarity in terms of surface-\nlevel, lexical, and semantic textual features.\nThis hints that \ufb01nding a passage similar to a\ngold instance has the potential to give a passage\nsuitable for test papers. The \ufb01lters used were rela-\ntively simple; with further improvements, the per-\nformance can improve. However, we failed to \ufb01nd\nmeaningful correlations with any of the speci\ufb01c\nfeatures. This leads us to our second insight.\n2.\n\"Suitability\" is a multi-aspect textual\nproperty, de\ufb01nitely not captured on the surface\nlevel. From Table 3 and Fig. 2, it seems clear\nthat one does not think a passage is suitable just\nby #words or #sentences. In addition, the classi-",
+    "length": 994
+  },
+  {
+    "chat_id": 16,
+    "text": "level. From Table 3 and Fig. 2, it seems clear\nthat one does not think a passage is suitable just\nby #words or #sentences. In addition, the classi-\n\ufb01ed CEFR level of a passage had no signi\ufb01cant\ncorrelation with its suitability. The CEFR levels\nare analogous to a passage\u2019s readability (Xia et al.,\n2016), which seems to have minimal correlation\nwith suitability.\nIn fact, we \ufb01nd that no meaningful correlation\nand distribution exist between any tested single\nfeature and suitability. On how \ufb01ltered passages\nscored better than dummy passages, we believe\nthat certain combinations of textual features lead\nto high suitability as a test reading passage.\nOne expects to see a certain type of a passage\nin a test paper. Such suitability is not measured\nby objective aggregation of textual features, unlike\nsome other NLP tasks like readability assessment\n(Collins-Thompson, 2014). Hence, common pre-\ndiction models like regression would not work well,\ncomplicating the task solution.\n4",
+    "length": 981
+  },
+  {
+    "chat_id": 17,
+    "text": "(Collins-Thompson, 2014). Hence, common pre-\ndiction models like regression would not work well,\ncomplicating the task solution.\n4\nWeaknesses & Future Directions\n4.1\nContextual Dependency\nFor a passage to be appropriate for reading com-\nprehension tests, it is required that the passage is\nunderstandable by itself. The passage could be\nself-contained and not dependent on the preceding\ntext, table, or \ufb01gure. Otherwise, the uncertain parts\nshould be easily inferable. Along with more sophis-\nticated preprocessing methods that detect strings\nlike \"Table\" or \"Figure\", we plan to develop inter-\nparagraph dependency detection algorithms.\nFigure 2: Scatter plots showing unclear trends. y la-\nbel: suitability score, x label: #sent (left) and #word\n(right).\n4.2\nEvaluation Method\nThe test outlined in Section 3 is based on a small\npopulation. Further, it is human-dependent and\nis not easily reproducible. In future works, we\nplan to introduce an objective evaluation method.",
+    "length": 974
+  },
+  {
+    "chat_id": 18,
+    "text": "population. Further, it is human-dependent and\nis not easily reproducible. In future works, we\nplan to introduce an objective evaluation method.\nThis possibly consists of a classi\ufb01cation dataset,\nwhere gold instances are mixed with its neighbor-\ning paragraphs from the same source article. Then,\na model could be adjusted to choose the gold in-\nstance among the neighboring paragraphs.\n4.3\nAuto-Calibration of Filter Conditions\nIn Section 3.1, we manually set the parameters \u03b1\nfor each condition. This is yet another weakness\nthat makes the study dif\ufb01cult to reproduce. For our\n\ufb01lter-based method to be widely useful for both\ncommercial and academic purposes, we need an\nalgorithm that automatically adjusts condition pa-\nrameters, based on the number of desired outputs.\n5\nConclusion\nWe proved that \ufb01nding a similar passage (to an\nalready test-appeared passage, or a gold instance)\nhas the possibility to give a suitable passage for\ntest development. Due to lacking correlation or dis-",
+    "length": 987
+  },
+  {
+    "chat_id": 19,
+    "text": "has the possibility to give a suitable passage for\ntest development. Due to lacking correlation or dis-\ntributional relationship between any single feature\nand suitability rating, we could not prove why we\nobtained our desired outcome. But we postulated\nthat certain combinations of textual features lead to\nhigh suitability as one expects to see certain types\nof passages in a test paper.",
+    "length": 389
+  },
+  {
+    "chat_id": 20,
+    "text": "--- PAGE BREAK -'--\nReferences\nCollege-Board. 2017. Sat\u00ae suite of assessments tech-\nnical manual: Characteristics of the sat.\nKevyn Collins-Thompson. 2014.\nComputational as-\nsessment of text readability: A survey of current\nand future research.\nITL-International Journal of\nApplied Linguistics, 165(2):97\u2013135.\nEducational-Testing-Service. 2010.\nToe\ufb02ibt\u00ae test\nframework and test development.\nWael H Gomaa, Aly A Fahmy, et al. 2013. A survey of\ntext similarity approaches. international journal of\nComputer Applications, 68(13):13\u201318.\nMatthew Honnibal and Ines Montani. 2017. spacy 2:\nNatural language understanding with bloom embed-\ndings, convolutional neural networks and incremen-\ntal parsing. To appear.\nChing-Kun Hsu, Gwo-Jen Hwang, and Chih-Kai\nChang. 2010.\nDevelopment of a reading mate-\nrial recommendation system based on a knowledge\nengineering approach.\nComputers & Education,\n55(1):76\u201383.\nKICE. 2014. What is csat (college scholastic ability\ntest)?",
+    "length": 959
+  },
+  {
+    "chat_id": 21,
+    "text": "engineering approach.\nComputers & Education,\n55(1):76\u201383.\nKICE. 2014. What is csat (college scholastic ability\ntest)?\nChin-Hwa Kuo, Chen-Chung Chi, et al. 2014. Design-\ning a reading material recommendation system for\ne\ufb02learners. Journal of Applied Science and Engi-\nneering, 17(4):371\u2013382.\nBruce W. Lee, Yoo Sung Jang, and Jason Lee. 2021.\nPushing on text readability assessment: A trans-\nformer meets handcrafted linguistic features. In Pro-\nceedings of the 2021 Conference on Empirical Meth-\nods in Natural Language Processing, pages 10669\u2013\n10686, Online and Punta Cana, Dominican Republic.\nAssociation for Computational Linguistics.\nBruce W. Lee and Jason Lee. 2020.\nLXPER index\n2.0: Improving text readability assessment model\nfor L2 English students in Korea. In Proceedings of\nthe 6th Workshop on Natural Language Processing\nTechniques for Educational Applications, pages 20\u2013\n24, Suzhou, China. Association for Computational\nLinguistics.\nDimas Wibisono Prakoso, Asad Abdi, and Chintan Am-",
+    "length": 995
+  },
+  {
+    "chat_id": 22,
+    "text": "24, Suzhou, China. Association for Computational\nLinguistics.\nDimas Wibisono Prakoso, Asad Abdi, and Chintan Am-\nrit. 2021. Short text similarity measurement meth-\nods: a review. Soft Computing, 25(6):4699\u20134723.\nNils Reimers and Iryna Gurevych. 2019.\nSentence-\nBERT: Sentence embeddings using Siamese BERT-\nnetworks. In Proceedings of the 2019 Conference on\nEmpirical Methods in Natural Language Processing\nand the 9th International Joint Conference on Natu-\nral Language Processing (EMNLP-IJCNLP), pages\n3982\u20133992, Hong Kong, China. Association for\nComputational Linguistics.\nWenhui Wang, Furu Wei, Li Dong, Hangbo Bao, Nan\nYang, and Ming Zhou. 2020. Minilm: Deep self-\nattention distillation for task-agnostic compression\nof pre-trained transformers. Advances in Neural In-\nformation Processing Systems, 33:5776\u20135788.\nPaul A Westrick, Jessica P Marini, Linda Young, Helen\nNg, Doron Shmueli, and Emily J Shaw. 2019. Valid-\nity of the sat\u00ae for predicting \ufb01rst-year grades and re-",
+    "length": 979
+  },
+  {
+    "chat_id": 23,
+    "text": "Ng, Doron Shmueli, and Emily J Shaw. 2019. Valid-\nity of the sat\u00ae for predicting \ufb01rst-year grades and re-\ntention to the second year. College Board Research\nPaper.\nMenglin Xia, Ekaterina Kochmar, and Ted Briscoe.\n2016.\nText readability assessment for second lan-\nguage learners.\nIn Proceedings of the 11th Work-\nshop on Innovative Use of NLP for Building Edu-\ncational Applications, pages 12\u201322, San Diego, CA.\nAssociation for Computational Linguistics.\nA\nSample Gold Instance\n\u2014 Mending and restoring objects often require even\nmore creativity than original production. The prein-\ndustrial blacksmith made things to order for people\nin his immediate community; customizing the prod-\nuct, modifying or transforming it according to the\nuser, was routine. Customers would bring things\nback if something went wrong; repair was thus an\nextension of fabrication. With industrialization and\neventually with mass production, making things be-\ncame the province of machine tenders with limited",
+    "length": 984
+  },
+  {
+    "chat_id": 24,
+    "text": "eventually with mass production, making things be-\ncame the province of machine tenders with limited\nknowledge. But repair continued to requirea larger\ngrasp of design and materials, an understanding of\nthe whole and a comprehension of the designer\u2019s\nintentions. \u201cManufacturers all work by machinery\nor by vast subdivisionof labour and not, so to speak,\nby hand,\u201d an 1896 Manual of Mending and Repair-\ning explained. \u201cBut all repairing must be done by\nhand. We can make every detail of a watch or of\nagun by machinery, but the machine cannot mend\nit when broken, much less a clock or a pistol!\u201d \u2014\nThe above (gold instance) is from 2022 CSAT,\n<Waste and Want: A Social History of Trash>.\nHenry Holt and Company. Susan Strasser. 2014",
+    "length": 731
+  },
+  {
+    "chat_id": 25,
+    "text": "--- PAGE BREAK -'--",
+    "length": 19
+  }
+]

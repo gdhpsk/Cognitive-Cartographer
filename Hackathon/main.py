@@ -7,7 +7,9 @@ import fitz
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pathlib import Path
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+import nltk
+from nltk.tokenize import sent_tokenize
+nltk.download("punkt_tab", quiet=True)
 import json
 from langchain_openai import OpenAIEmbeddings
 from qdrant_client import QdrantClient
@@ -36,11 +38,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-splitter = RecursiveCharacterTextSplitter(
-    chunk_size=100,
-    chunk_overlap=50,
-    length_function=len,
-)
 
 embeddings = OpenAIEmbeddings(
     model="text-embedding-3-small",
@@ -96,14 +93,18 @@ def get_3d_positions(embeddings_2d):
     returns:
         list of {"x", "y", "z"} dicts, one per vector
     """
-    X = np.array(embeddings_2d)
-    pca = PCA(n_components=3)
+    X = np.array(embeddings_2d)  # converts it into a matrix
+    pca = PCA(n_components=3)  # uses the matrix to convert it from 1536 to 3
     X_3d = pca.fit_transform(X)
-    mins = X_3d.min(axis=0)  # normalized them
-    maxs = X_3d.max(axis=0)
+    mins = X_3d.min(
+        axis=0
+    )  # normalized them on the columns axis because that is the dataset axis
+    maxs = X_3d.max(
+        axis=0
+    )  # normalized them on the columns axis because that is the dataset axis
     ranges = maxs - mins
     ranges[ranges == 0] = 1  # avoid division by zero
-    X_3d = 2 * (X_3d - mins) / ranges - 1
+    X_3d = 2 * (X_3d - mins) / ranges - 1  #
     max_norm = np.linalg.norm(X_3d, axis=1).max()
     if max_norm > 0:
         X_3d = X_3d / max_norm
@@ -154,7 +155,7 @@ async def websocket_upload(websocket: WebSocket):
             await websocket.send_json(
                 {"event": "status", "data": "Splitting text into chunks..."}
             )
-            chunks = splitter.split_text(text)
+            chunks = sent_tokenize(text)
             global chunks_data
             chunks_data = [
                 {"chat_id": i, "text": chunk, "length": len(chunk)}
