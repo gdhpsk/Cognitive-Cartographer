@@ -401,7 +401,7 @@ def get_graph():
     }
 
 
-MAX_SEQ_LEN = 20
+MAX_SEQ_LEN = 50
 MAX_NEW_TOKENS = 10
 
 
@@ -594,13 +594,36 @@ async def websocket_attention(websocket: WebSocket):
                     }
                 )
 
-            # 5. Send final answer (assembled from generated tokens)
+            # 5. Reformat the raw answer with Mistral
+            raw_answer = "".join(full_answer).strip()
+            reformat_msgs = [
+                {
+                    "role": "user",
+                    "content": f"Rewrite the following text clearly and concisely in plain English. Do not add any new information, just clean up the formatting:\n\n{raw_answer}",
+                },
+            ]
+            reformat_ids = tokenizer.apply_chat_template(
+                reformat_msgs, return_tensors="pt"
+            )
+            if not isinstance(reformat_ids, torch.Tensor):
+                reformat_ids = reformat_ids["input_ids"]
+            if reformat_ids.dim() == 1:
+                reformat_ids = reformat_ids.unsqueeze(0)
+            reformat_ids = reformat_ids.to(device)
+
+            with torch.no_grad():
+                reformat_out = local_model.generate(reformat_ids, max_new_tokens=300)
+            clean_tokens = reformat_out[0, reformat_ids.shape[1] :]
+            clean_answer = tokenizer.decode(
+                clean_tokens, skip_special_tokens=True
+            ).strip()
+
             await websocket.send_json(
                 {
                     "event": "answer",
                     "data": {
                         "query": query,
-                        "answer": "".join(full_answer).strip(),
+                        "answer": clean_answer,
                         "sources": [
                             {"text": doc.page_content, "metadata": doc.metadata}
                             for doc in docs
