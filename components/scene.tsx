@@ -23,8 +23,8 @@ const white = new THREE.Color('white');
 const red = new THREE.Color('#dbf702');
 const blue = new THREE.Color('#96b2ff');
 const targetColor = new THREE.Color();
-const SOFT_BOUNDARY_RADIUS = 7.4;
-const OVERFLOW_PULL = 0.18;
+const SOFT_BOUNDARY_RADIUS = 7.2;
+const OVERFLOW_PULL = 0.24;
 const CYLINDER_BASE_DIR = new THREE.Vector3(0, 1, 0);
 const SELECTED_EDGE_RADIUS = 0.02;
 
@@ -36,6 +36,8 @@ function ForceGraph({ nodes, edges, simNodesRefOut }: { nodes: NodeData[]; edges
   const lineGeoRef = useRef<THREE.BufferGeometry>(null);
   const activeLineGeoRef = useRef<THREE.BufferGeometry>(null);
   const selectedLineGeoRef = useRef<THREE.BufferGeometry>(null);
+  const lineMatRef = useRef<THREE.LineBasicMaterial>(null);
+  const activeLineMatRef = useRef<THREE.LineBasicMaterial>(null);
   const selectedEdgeMeshRef = useRef<THREE.InstancedMesh>(null);
   const selectedEdgeDummyRef = useRef<THREE.Object3D>(new THREE.Object3D());
   const tooltipRef = useRef<THREE.Group>(null);
@@ -96,11 +98,11 @@ function ForceGraph({ nodes, edges, simNodesRefOut }: { nodes: NodeData[]; edges
     // before chained methods run, so .numDimensions(3) after construction is too late
     const sim = forceSimulation<SimNode>(simNodes, 3)
       .force('link', forceLink<SimNode, SimLink>(simLinks).id((d: SimNode) => d.id).distance(1.2))
-      .force('charge', forceManyBody<SimNode>().strength(-0.9).distanceMax(4))
+      .force('charge', forceManyBody<SimNode>().strength(-0.5).distanceMax(3))
       .force('center', forceCenter<SimNode>(0, 0, 0))
-      .force('compactness', forceRadial<SimNode>(0).strength(0.06))
+      .force('compactness', forceRadial<SimNode>(0).strength(0.15))
       .alphaDecay(0.02)
-      .velocityDecay(0.3);
+      .velocityDecay(0.36);
 
     // Stop the auto-timer immediately — we tick manually in useFrame
     sim.stop();
@@ -120,7 +122,7 @@ function ForceGraph({ nodes, edges, simNodesRefOut }: { nodes: NodeData[]; edges
 
     sim.tick();
 
-    // Softly nudge overflow nodes inward to keep the graph mostly inside the sphere.
+    // Keep nodes from accumulating on the outer shell by nudging overflow inward.
     for (const sn of simNodes) {
       const x = sn.x ?? 0;
       const y = sn.y ?? 0;
@@ -145,6 +147,17 @@ function ForceGraph({ nodes, edges, simNodesRefOut }: { nodes: NodeData[]; edges
         if (edge.sourceId === selectedNodeId) selectedClusterIds.add(edge.targetId);
         if (edge.targetId === selectedNodeId) selectedClusterIds.add(edge.sourceId);
       }
+    }
+
+    const baseOpacityTarget = 0.06;
+    const activeOpacityTarget = 0.22;
+    if (lineMatRef.current) {
+      lineMatRef.current.opacity = THREE.MathUtils.lerp(lineMatRef.current.opacity, baseOpacityTarget, 0.15);
+      lineMatRef.current.needsUpdate = true;
+    }
+    if (activeLineMatRef.current) {
+      activeLineMatRef.current.opacity = THREE.MathUtils.lerp(activeLineMatRef.current.opacity, activeOpacityTarget, 0.15);
+      activeLineMatRef.current.needsUpdate = true;
     }
 
     // Move each mesh to its simulation position and lerp colors
@@ -359,13 +372,13 @@ function ForceGraph({ nodes, edges, simNodesRefOut }: { nodes: NodeData[]; edges
       {/* Single LineSegments for all edges */}
       <lineSegments frustumCulled={false} renderOrder={2}>
         <bufferGeometry ref={lineGeoRef} />
-        <lineBasicMaterial color="white" opacity={0.3} transparent depthTest={false} depthWrite={false} linewidth={1} />
+        <lineBasicMaterial ref={lineMatRef} color="white" opacity={0.3} transparent depthTest depthWrite={false} linewidth={1} />
       </lineSegments>
 
       {/* Active edge highlights */}
       <lineSegments frustumCulled={false} renderOrder={3}>
         <bufferGeometry ref={activeLineGeoRef} />
-        <lineBasicMaterial color="cyan" opacity={1} depthTest={false} depthWrite={false} linewidth={1} />
+        <lineBasicMaterial ref={activeLineMatRef} color="cyan" opacity={1} depthTest depthWrite={false} linewidth={1} />
       </lineSegments>
 
       {/* Selected cluster edge highlights */}
@@ -375,7 +388,7 @@ function ForceGraph({ nodes, edges, simNodesRefOut }: { nodes: NodeData[]; edges
       </lineSegments>
 
       {/* Selected cluster thick edge overlays */}
-      <instancedMesh ref={selectedEdgeMeshRef} args={[undefined, undefined, Math.max(edges.length, 1)]} frustumCulled={false} renderOrder={5}>
+      <instancedMesh ref={selectedEdgeMeshRef} args={[undefined, undefined, Math.max(edges.length, 1)]} frustumCulled={false} renderOrder={5} count={0}>
         <cylinderGeometry args={[SELECTED_EDGE_RADIUS, SELECTED_EDGE_RADIUS, 1, 8]} />
         <meshBasicMaterial color="#dc2626" opacity={1} transparent depthTest={false} depthWrite={false} />
       </instancedMesh>
@@ -433,8 +446,7 @@ function Axes() {
 const DEFAULT_CAM_POS = new THREE.Vector3(0, 2, 28);
 const DEFAULT_TARGET = new THREE.Vector3(0, 0, 0);
 const CAM_OFFSET_DISTANCE = 5;
-const SELECTED_ZOOM_FACTOR = 0.55;
-const MIN_SELECTED_DISTANCE = 1.8;
+const SELECTED_CAM_BEHIND = 4; // how far behind the node the camera sits
 
 function CameraController({ simNodesRef, controlsRef }: {
   simNodesRef: React.RefObject<SimNode[]>;
@@ -475,17 +487,12 @@ function CameraController({ simNodesRef, controlsRef }: {
         if (selectedChanged) {
           const selectedNode = simNodes.find((n) => n.id === selectedNodeId);
           if (selectedNode) {
-            const selectedPos = new THREE.Vector3(selectedNode.x ?? 0, selectedNode.y ?? 0, selectedNode.z ?? 0);
-            const currentCamPos = new THREE.Vector3(camera.position.x, camera.position.y, camera.position.z);
-            const nextCamPos = currentCamPos.lerp(selectedPos, SELECTED_ZOOM_FACTOR);
-
-            const targetVec = new THREE.Vector3(DEFAULT_TARGET.x, DEFAULT_TARGET.y, DEFAULT_TARGET.z);
-            const toTarget = new THREE.Vector3().subVectors(nextCamPos, targetVec);
-            const distanceToTarget = toTarget.length();
-            if (distanceToTarget < MIN_SELECTED_DISTANCE && distanceToTarget > 0) {
-              toTarget.setLength(MIN_SELECTED_DISTANCE);
-              nextCamPos.copy(targetVec).add(toTarget);
-            }
+            // Place camera along the origin→node ray, behind the node,
+            // so the node is centered on screen (camera looks at origin).
+            const nodePos = new THREE.Vector3(selectedNode.x ?? 0, selectedNode.y ?? 0, selectedNode.z ?? 0);
+            const nodeDist = nodePos.length();
+            const dir = nodeDist > 0 ? nodePos.clone().normalize() : new THREE.Vector3(0, 0, 1);
+            const nextCamPos = dir.multiplyScalar(nodeDist + SELECTED_CAM_BEHIND);
 
             gsap.to(camera.position, {
               x: nextCamPos.x,
