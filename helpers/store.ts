@@ -1,0 +1,78 @@
+import { create } from 'zustand';
+
+export const generateRandomHex = () => {
+  const randomColor = Math.floor(Math.random() * 16777215).toString(16);
+  return "#" + randomColor.padStart(6, '0');
+};
+
+export interface GraphNode {
+  id: string;
+  label: string;
+  text: string;
+  x: number;
+  y: number;
+  z: number;
+}
+
+export interface GraphEdge {
+  source: string;
+  target: string;
+}
+
+export interface GraphData {
+  nodes: GraphNode[];
+  edges: GraphEdge[];
+}
+
+export interface NodeData {
+  id: string;
+  label: string;
+  text: string;
+  position: [number, number, number];
+  color: string;
+}
+
+export interface EdgeData {
+  sourceId: string;
+  targetId: string;
+}
+
+interface AppState {
+  nodes: NodeData[];
+  edges: EdgeData[];
+  isLoading: boolean;
+  activeNodeIds: Set<string>;
+  selectedNodeId: string | null;
+  addNode: (label: string, position: [number, number, number], text?: string) => string;
+  addEdge: (sourceId: string, targetId: string) => void;
+  setLoading: (status: boolean) => void;
+  setActiveNodes: (ids: string[]) => void;
+  setSelectedNode: (id: string | null) => void;
+  loadGraph: (nodes: NodeData[], edges: EdgeData[]) => void;
+}
+
+
+
+export const useAppStore = create<AppState>((set) => ({
+  nodes: [],
+  edges: [],
+  isLoading: false,
+  activeNodeIds: new Set<string>(),
+
+  addNode: (label, position, text = '') => {
+    const id = Math.random().toString();
+    set((state) => ({
+      nodes: [...state.nodes, { id, label, text, position, color: generateRandomHex() }]
+    }));
+    return id;
+  },
+
+  addEdge: (sourceId, targetId) => set((state) => ({
+    edges: [...state.edges, { sourceId, targetId }]
+  })),
+  selectedNodeId: null,
+  setActiveNodes: (ids) => set({ activeNodeIds: new Set(ids) }),
+  setSelectedNode: (id) => set({ selectedNodeId: id }),
+  loadGraph: (nodes, edges) => set({ nodes, edges, activeNodeIds: new Set(), selectedNodeId: null }),
+  setLoading: (status) => set({ isLoading: status })
+}));
