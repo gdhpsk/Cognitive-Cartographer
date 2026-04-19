@@ -9,8 +9,19 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Slider } from '@/components/ui/slider';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { Separator } from '@/components/ui/separator';
+import { Switch } from '@/components/ui/switch';
+import { Select, SelectTrigger, SelectValue, SelectContent, SelectItem } from '@/components/ui/select';
+import Markdown from 'react-markdown';
+import { Textarea } from '@/components/ui/textarea';
+import { SpotlightCard } from '@/components/ui/spotlight-card';
+import { TextGenerateEffect } from '@/components/ui/text-generate';
+import { GlowingBorder } from '@/components/ui/glowing-border';
 
 const MIN_SCREEN_WIDTH = 1200;
+const CUSTOM_MODEL_OPTION = '__custom__';
+const ALLOW_CUSTOM_MODEL = ['1', 'true', 'yes', 'on'].includes(
+  String(process.env.NEXT_PUBLIC_ALLOW_CUSTOM ?? '').toLowerCase()
+);
 
 interface QuerySource {
   text: string;
@@ -22,11 +33,313 @@ type HeadHeatmap = {
   values: Float32Array;
 };
 
-function clamp01(value: number): number {
+type WebglHeatmapRenderer = {
+  canvas: HTMLCanvasElement;
+  gl: WebGL2RenderingContext;
+  program: WebGLProgram;
+  texture: WebGLTexture;
+  vertexBuffer: WebGLBuffer;
+  aPosition: number;
+  uData: WebGLUniformLocation;
+  uScaleMax: WebGLUniformLocation;
+  uWidthPx: WebGLUniformLocation;
+  uHeightPx: WebGLUniformLocation;
+  uUseLowerTriMask: WebGLUniformLocation;
+  uShowHeadSeparators: WebGLUniformLocation;
+  uTileSizePx: WebGLUniformLocation;
+  textureWidth: number;
+  textureHeight: number;
+};
+
+type WebglPaintOptions = {
+  maxValue: number;
+  useLowerTriMask: boolean;
+  showHeadSeparators: boolean;
+  tileSizePx: number;
+};
+
+let sharedWebglHeatmapRenderer: WebglHeatmapRenderer | null = null;
+
+const HEATMAP_VERTEX_SHADER = `
+attribute vec2 a_position;
+varying vec2 v_uv;
+
+void main() {
+  v_uv = (a_position + 1.0) * 0.5;
+  gl_Position = vec4(a_position, 0.0, 1.0);
+}
+`;
+
+const HEATMAP_FRAGMENT_SHADER = `
+precision highp float;
+
+varying vec2 v_uv;
+uniform sampler2D u_data;
+uniform float u_scaleMax;
+uniform float u_widthPx;
+uniform float u_heightPx;
+uniform float u_useLowerTriMask;
+uniform float u_showHeadSeparators;
+uniform float u_tileSizePx;
+
+void main() {
+  vec2 uv = vec2(v_uv.x, 1.0 - v_uv.y);
+  float value = max(texture2D(u_data, uv).r, 0.0);
+  float normalized = clamp(value / max(u_scaleMax, 1e-6), 0.0, 1.0);
+
+  if (u_useLowerTriMask > 0.5) {
+    float xPx = floor(uv.x * u_widthPx);
+    float yPx = floor(uv.y * u_heightPx);
+    if (xPx > yPx) {
+      normalized = 0.0;
+    }
+  }
+
+  if (u_showHeadSeparators > 0.5 && u_tileSizePx > 1.0) {
+    float xPx = floor(uv.x * u_widthPx);
+    if (xPx > 0.0 && mod(xPx + 1.0, u_tileSizePx) < 1.0) {
+      gl_FragColor = vec4(100.0 / 255.0, 100.0 / 255.0, 100.0 / 255.0, 1.0);
+      return;
+    }
+  }
+
+  gl_FragColor = vec4(0.0, normalized, normalized, 1.0);
+}
+`;
+
+function toAbsoluteIntensity(value: number, maxValue: number): number {
   if (!Number.isFinite(value)) return 0;
-  if (value <= 0) return 0;
-  if (value >= 1) return 1;
-  return value;
+  const scaled = (Math.max(value, 0) / Math.max(maxValue, 1e-6)) * 255;
+  if (scaled <= 0) return 0;
+  if (scaled >= 255) return 255;
+  return Math.round(scaled);
+}
+
+function getPositivePeak(values: Float32Array): number {
+  let peak = 0;
+  for (let i = 0; i < values.length; i++) {
+    const value = values[i];
+    if (Number.isFinite(value) && value > peak) {
+      peak = value;
+    }
+  }
+  return peak > 0 ? peak : 1;
+}
+
+function resolveScaleMax(scaleMax: number | undefined, fallbackValues: Float32Array): number {
+  if (typeof scaleMax === 'number' && Number.isFinite(scaleMax) && scaleMax > 0) {
+    return scaleMax;
+  }
+  return getPositivePeak(fallbackValues);
+}
+
+function compileWebglShader(gl: WebGL2RenderingContext, type: number, source: string): WebGLShader | null {
+  const shader = gl.createShader(type);
+  if (!shader) return null;
+
+  gl.shaderSource(shader, source);
+  gl.compileShader(shader);
+  if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+    gl.deleteShader(shader);
+    return null;
+  }
+  return shader;
+}
+
+function createWebglProgram(
+  gl: WebGL2RenderingContext,
+  vertexSource: string,
+  fragmentSource: string
+): WebGLProgram | null {
+  const vertexShader = compileWebglShader(gl, gl.VERTEX_SHADER, vertexSource);
+  const fragmentShader = compileWebglShader(gl, gl.FRAGMENT_SHADER, fragmentSource);
+  if (!vertexShader || !fragmentShader) {
+    if (vertexShader) gl.deleteShader(vertexShader);
+    if (fragmentShader) gl.deleteShader(fragmentShader);
+    return null;
+  }
+
+  const program = gl.createProgram();
+  if (!program) {
+    gl.deleteShader(vertexShader);
+    gl.deleteShader(fragmentShader);
+    return null;
+  }
+
+  gl.attachShader(program, vertexShader);
+  gl.attachShader(program, fragmentShader);
+  gl.linkProgram(program);
+  gl.deleteShader(vertexShader);
+  gl.deleteShader(fragmentShader);
+
+  if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+    gl.deleteProgram(program);
+    return null;
+  }
+
+  return program;
+}
+
+function createWebglHeatmapRenderer(): WebglHeatmapRenderer | null {
+  const internalCanvas = document.createElement('canvas');
+  const gl = internalCanvas.getContext('webgl2', {
+    alpha: false,
+    antialias: false,
+    depth: false,
+    stencil: false,
+    premultipliedAlpha: false,
+    preserveDrawingBuffer: false,
+  });
+  if (!gl) return null;
+
+  const program = createWebglProgram(gl, HEATMAP_VERTEX_SHADER, HEATMAP_FRAGMENT_SHADER);
+  if (!program) return null;
+
+  const texture = gl.createTexture();
+  const vertexBuffer = gl.createBuffer();
+  if (!texture || !vertexBuffer) {
+    if (texture) gl.deleteTexture(texture);
+    if (vertexBuffer) gl.deleteBuffer(vertexBuffer);
+    gl.deleteProgram(program);
+    return null;
+  }
+
+  const aPosition = gl.getAttribLocation(program, 'a_position');
+  const uData = gl.getUniformLocation(program, 'u_data');
+  const uScaleMax = gl.getUniformLocation(program, 'u_scaleMax');
+  const uWidthPx = gl.getUniformLocation(program, 'u_widthPx');
+  const uHeightPx = gl.getUniformLocation(program, 'u_heightPx');
+  const uUseLowerTriMask = gl.getUniformLocation(program, 'u_useLowerTriMask');
+  const uShowHeadSeparators = gl.getUniformLocation(program, 'u_showHeadSeparators');
+  const uTileSizePx = gl.getUniformLocation(program, 'u_tileSizePx');
+
+  if (
+    aPosition < 0 ||
+    !uData ||
+    !uScaleMax ||
+    !uWidthPx ||
+    !uHeightPx ||
+    !uUseLowerTriMask ||
+    !uShowHeadSeparators ||
+    !uTileSizePx
+  ) {
+    gl.deleteTexture(texture);
+    gl.deleteBuffer(vertexBuffer);
+    gl.deleteProgram(program);
+    return null;
+  }
+
+  gl.bindBuffer(gl.ARRAY_BUFFER, vertexBuffer);
+  gl.bufferData(
+    gl.ARRAY_BUFFER,
+    new Float32Array([
+      -1, -1,
+      1, -1,
+      -1, 1,
+      1, 1,
+    ]),
+    gl.STATIC_DRAW
+  );
+
+  gl.bindTexture(gl.TEXTURE_2D, texture);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, 0);
+
+  const renderer: WebglHeatmapRenderer = {
+    canvas: internalCanvas,
+    gl,
+    program,
+    texture,
+    vertexBuffer,
+    aPosition,
+    uData,
+    uScaleMax,
+    uWidthPx,
+    uHeightPx,
+    uUseLowerTriMask,
+    uShowHeadSeparators,
+    uTileSizePx,
+    textureWidth: 0,
+    textureHeight: 0,
+  };
+
+  return renderer;
+}
+
+function getSharedWebglHeatmapRenderer(): WebglHeatmapRenderer | null {
+  if (sharedWebglHeatmapRenderer) return sharedWebglHeatmapRenderer;
+  sharedWebglHeatmapRenderer = createWebglHeatmapRenderer();
+  return sharedWebglHeatmapRenderer;
+}
+
+function paintFloatBufferWebgl(
+  canvas: HTMLCanvasElement,
+  values: Float32Array,
+  width: number,
+  height: number,
+  options: WebglPaintOptions
+): boolean {
+  const renderer = getSharedWebglHeatmapRenderer();
+  if (!renderer) return false;
+
+  if (renderer.canvas.width !== width) renderer.canvas.width = width;
+  if (renderer.canvas.height !== height) renderer.canvas.height = height;
+
+  const { gl } = renderer;
+  gl.viewport(0, 0, width, height);
+  gl.useProgram(renderer.program);
+
+  gl.bindBuffer(gl.ARRAY_BUFFER, renderer.vertexBuffer);
+  gl.enableVertexAttribArray(renderer.aPosition);
+  gl.vertexAttribPointer(renderer.aPosition, 2, gl.FLOAT, false, 0, 0);
+
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, renderer.texture);
+
+  if (renderer.textureWidth !== width || renderer.textureHeight !== height) {
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32F, width, height, 0, gl.RED, gl.FLOAT, values);
+    renderer.textureWidth = width;
+    renderer.textureHeight = height;
+  } else {
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, width, height, gl.RED, gl.FLOAT, values);
+  }
+
+  if (gl.getError() !== gl.NO_ERROR) {
+    sharedWebglHeatmapRenderer = null;
+    return false;
+  }
+
+  gl.uniform1i(renderer.uData, 0);
+  gl.uniform1f(renderer.uScaleMax, Math.max(options.maxValue, 1e-6));
+  gl.uniform1f(renderer.uWidthPx, width);
+  gl.uniform1f(renderer.uHeightPx, height);
+  gl.uniform1f(renderer.uUseLowerTriMask, options.useLowerTriMask ? 1 : 0);
+  gl.uniform1f(renderer.uShowHeadSeparators, options.showHeadSeparators ? 1 : 0);
+  gl.uniform1f(renderer.uTileSizePx, Math.max(1, options.tileSizePx));
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+
+  if (gl.getError() !== gl.NO_ERROR) {
+    sharedWebglHeatmapRenderer = null;
+    return false;
+  }
+
+  const targetCtx = canvas.getContext('2d');
+  if (!targetCtx) return false;
+  if (canvas.width !== width) canvas.width = width;
+  if (canvas.height !== height) canvas.height = height;
+  targetCtx.clearRect(0, 0, width, height);
+  targetCtx.drawImage(renderer.canvas, 0, 0, width, height);
+
+  return true;
+}
+
+function toFiniteNumber(value: unknown, fallback = 0): number {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
 }
 
 function toPositiveInt(value: unknown, fallback: number): number {
@@ -81,7 +394,7 @@ function writeMatrix(heatmap: HeadHeatmap, matrixRows: unknown[]): void {
 
     const maxCol = Math.min(size, rowValues.length, row + 1);
     for (let col = 0; col < maxCol; col++) {
-      heatmap.values[row * size + col] = clamp01(Number(rowValues[col]));
+      heatmap.values[row * size + col] = toFiniteNumber(rowValues[col]);
     }
   }
 }
@@ -93,11 +406,45 @@ function writeRow(heatmap: HeadHeatmap, rowValues: unknown[], rowIndex: number):
   const safeRow = Math.max(0, Math.min(size - 1, rowIndex));
   const maxCol = Math.min(size, rowValues.length, safeRow + 1);
   for (let col = 0; col < maxCol; col++) {
-    heatmap.values[safeRow * size + col] = clamp01(Number(rowValues[col]));
+    heatmap.values[safeRow * size + col] = toFiniteNumber(rowValues[col]);
   }
 }
 
-function paintHeatmap(canvas: HTMLCanvasElement, heatmap: HeadHeatmap | null): void {
+function buildLayerAtlasValues(
+  layerHeatmaps: HeadHeatmap[] | undefined,
+  heads: number,
+  seqLen: number
+): { values: Float32Array; width: number; height: number; tileSize: number; safeHeads: number } {
+  const safeHeads = Math.max(1, heads);
+  const tileSize = Math.max(1, seqLen);
+  const width = safeHeads * tileSize;
+  const height = tileSize;
+  const values = new Float32Array(width * height);
+
+  for (let headIndex = 0; headIndex < safeHeads; headIndex++) {
+    const heatmap = layerHeatmaps?.[headIndex] ?? null;
+    const sourceSize = heatmap?.size ?? 0;
+
+    for (let row = 0; row < tileSize; row++) {
+      const sourceRow = row < sourceSize ? row : -1;
+      for (let col = 0; col < tileSize; col++) {
+        if (sourceRow >= 0 && col < sourceSize && col <= row && heatmap) {
+          const x = headIndex * tileSize + col;
+          const y = row;
+          values[y * width + x] = heatmap.values[sourceRow * sourceSize + col];
+        }
+      }
+    }
+  }
+
+  return { values, width, height, tileSize, safeHeads };
+}
+
+function paintHeatmapFallback2d(
+  canvas: HTMLCanvasElement,
+  heatmap: HeadHeatmap | null,
+  scaleMax?: number
+): void {
   const ctx = canvas.getContext('2d');
   if (!ctx) return;
 
@@ -110,6 +457,8 @@ function paintHeatmap(canvas: HTMLCanvasElement, heatmap: HeadHeatmap | null): v
   }
 
   const { size, values } = heatmap;
+  const maxValue = resolveScaleMax(scaleMax, values);
+
   if (canvas.width !== size) canvas.width = size;
   if (canvas.height !== size) canvas.height = size;
 
@@ -119,8 +468,8 @@ function paintHeatmap(canvas: HTMLCanvasElement, heatmap: HeadHeatmap | null): v
   for (let row = 0; row < size; row++) {
     for (let col = 0; col < size; col++) {
       const pixelIndex = (row * size + col) * 4;
-      const value = col <= row ? clamp01(values[row * size + col]) : 0;
-      const intensity = Math.round(value * 255);
+      const value = col <= row ? values[row * size + col] : 0;
+      const intensity = toAbsoluteIntensity(value, maxValue);
 
       data[pixelIndex] = 0;
       data[pixelIndex + 1] = intensity;
@@ -132,47 +481,35 @@ function paintHeatmap(canvas: HTMLCanvasElement, heatmap: HeadHeatmap | null): v
   ctx.putImageData(image, 0, 0);
 }
 
-function paintLayerAtlas(
+function paintLayerAtlasFallback2d(
   canvas: HTMLCanvasElement,
-  layerHeatmaps: HeadHeatmap[] | undefined,
-  heads: number,
-  seqLen: number
+  atlasValues: Float32Array,
+  width: number,
+  height: number,
+  safeHeads: number,
+  tileSize: number,
+  scaleMax?: number
 ): void {
   const ctx = canvas.getContext('2d');
   if (!ctx) return;
 
-  const safeHeads = Math.max(1, heads);
-  const tileSize = Math.max(1, seqLen);
-  const width = safeHeads * tileSize;
-  const height = tileSize;
-
   if (canvas.width !== width) canvas.width = width;
   if (canvas.height !== height) canvas.height = height;
 
+  const maxValue = resolveScaleMax(scaleMax, atlasValues);
   const image = ctx.createImageData(width, height);
   const data = image.data;
 
-  for (let headIndex = 0; headIndex < safeHeads; headIndex++) {
-    const heatmap = layerHeatmaps?.[headIndex] ?? null;
-    const sourceSize = heatmap?.size ?? 0;
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const pixelIndex = (y * width + x) * 4;
+      const value = atlasValues[y * width + x];
+      const intensity = toAbsoluteIntensity(value, maxValue);
 
-    for (let row = 0; row < tileSize; row++) {
-      const sourceRow = row < sourceSize ? row : -1;
-      for (let col = 0; col < tileSize; col++) {
-        let value = 0;
-        if (sourceRow >= 0 && col < sourceSize && col <= row && heatmap) {
-          value = clamp01(heatmap.values[sourceRow * sourceSize + col]);
-        }
-
-        const intensity = Math.round(value * 255);
-        const x = headIndex * tileSize + col;
-        const y = row;
-        const pixelIndex = (y * width + x) * 4;
-        data[pixelIndex] = 0;
-        data[pixelIndex + 1] = intensity;
-        data[pixelIndex + 2] = intensity;
-        data[pixelIndex + 3] = 255;
-      }
+      data[pixelIndex] = 0;
+      data[pixelIndex + 1] = intensity;
+      data[pixelIndex + 2] = intensity;
+      data[pixelIndex + 3] = 255;
     }
   }
 
@@ -192,12 +529,82 @@ function paintLayerAtlas(
   ctx.putImageData(image, 0, 0);
 }
 
+function paintHeatmap(
+  canvas: HTMLCanvasElement,
+  heatmap: HeadHeatmap | null,
+  preferWebgl = true,
+  scaleMax?: number
+): void {
+  if (!preferWebgl) {
+    paintHeatmapFallback2d(canvas, heatmap, scaleMax);
+    return;
+  }
+
+  if (!heatmap) {
+    const empty = new Float32Array(1);
+    const painted = paintFloatBufferWebgl(canvas, empty, 1, 1, {
+      maxValue: 1,
+      useLowerTriMask: false,
+      showHeadSeparators: false,
+      tileSizePx: 1,
+    });
+    if (!painted) {
+      paintHeatmapFallback2d(canvas, null, scaleMax);
+    }
+    return;
+  }
+
+  const { size, values } = heatmap;
+  const maxValue = resolveScaleMax(scaleMax, values);
+  const painted = paintFloatBufferWebgl(canvas, values, size, size, {
+    maxValue,
+    useLowerTriMask: true,
+    showHeadSeparators: false,
+    tileSizePx: size,
+  });
+  if (!painted) {
+    paintHeatmapFallback2d(canvas, heatmap, scaleMax);
+  }
+}
+
+function paintLayerAtlas(
+  canvas: HTMLCanvasElement,
+  layerHeatmaps: HeadHeatmap[] | undefined,
+  heads: number,
+  seqLen: number,
+  preferWebgl = true,
+  scaleMax?: number
+): void {
+  const atlas = buildLayerAtlasValues(layerHeatmaps, heads, seqLen);
+  if (preferWebgl) {
+    const maxValue = resolveScaleMax(scaleMax, atlas.values);
+    const painted = paintFloatBufferWebgl(canvas, atlas.values, atlas.width, atlas.height, {
+      maxValue,
+      useLowerTriMask: false,
+      showHeadSeparators: true,
+      tileSizePx: atlas.tileSize,
+    });
+    if (painted) return;
+  }
+
+  paintLayerAtlasFallback2d(
+    canvas,
+    atlas.values,
+    atlas.width,
+    atlas.height,
+    atlas.safeHeads,
+    atlas.tileSize,
+    scaleMax
+  );
+}
+
 function AttentionOverview({
   heatmaps,
   layers,
   heads,
   seqLen,
   version,
+  scaleMax,
   onPick,
   selectedLayerIndex,
 }: {
@@ -206,13 +613,16 @@ function AttentionOverview({
   heads: number;
   seqLen: number;
   version: number;
+  scaleMax?: number;
   onPick?: (layerIndex: number) => void;
   selectedLayerIndex?: number;
 }) {
   const canvasRefs = useRef<Array<HTMLCanvasElement | null>>([]);
   const [hoverLabel, setHoverLabel] = useState('Hover a layer plane to inspect');
   const [pan, setPan] = useState({ x: 0, y: 0 });
+  const [zoom, setZoom] = useState(1);
   const [isDragging, setIsDragging] = useState(false);
+  const containerRef = useRef<HTMLDivElement>(null);
   const dragStateRef = useRef({
     active: false,
     pointerId: -1,
@@ -231,12 +641,65 @@ function AttentionOverview({
     for (let layerIndex = 0; layerIndex < safeLayers; layerIndex++) {
       const canvas = canvasRefs.current[layerIndex];
       if (!canvas) continue;
-      paintLayerAtlas(canvas, heatmaps[layerIndex], safeHeads, safeSeqLen);
+      paintLayerAtlas(canvas, heatmaps[layerIndex], safeHeads, safeSeqLen, true, scaleMax);
     }
-  }, [heatmaps, safeLayers, safeHeads, safeSeqLen, version]);
+  }, [heatmaps, safeLayers, safeHeads, safeSeqLen, scaleMax, version]);
+
+  const pinchRef = useRef<{ dist: number } | null>(null);
+
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+
+    const clampZoom = (z: number) => Math.min(5, Math.max(0.2, z));
+
+    // scroll-wheel zoom
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      setZoom((prev) => clampZoom(prev * (e.deltaY < 0 ? 1.1 : 1 / 1.1)));
+    };
+
+    // pinch-to-zoom
+    const getTouchDist = (e: TouchEvent) => {
+      const [a, b] = [e.touches[0], e.touches[1]];
+      return Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY);
+    };
+    const onTouchStart = (e: TouchEvent) => {
+      if (e.touches.length === 2) {
+        e.preventDefault();
+        pinchRef.current = { dist: getTouchDist(e) };
+      }
+    };
+    const onTouchMove = (e: TouchEvent) => {
+      if (e.touches.length === 2 && pinchRef.current) {
+        e.preventDefault();
+        const newDist = getTouchDist(e);
+        const scale = newDist / pinchRef.current.dist;
+        pinchRef.current.dist = newDist;
+        setZoom((prev) => clampZoom(prev * scale));
+      }
+    };
+    const onTouchEnd = () => {
+      pinchRef.current = null;
+    };
+
+    el.addEventListener('wheel', onWheel, { passive: false });
+    el.addEventListener('touchstart', onTouchStart, { passive: false });
+    el.addEventListener('touchmove', onTouchMove, { passive: false });
+    el.addEventListener('touchend', onTouchEnd);
+    el.addEventListener('touchcancel', onTouchEnd);
+    return () => {
+      el.removeEventListener('wheel', onWheel);
+      el.removeEventListener('touchstart', onTouchStart);
+      el.removeEventListener('touchmove', onTouchMove);
+      el.removeEventListener('touchend', onTouchEnd);
+      el.removeEventListener('touchcancel', onTouchEnd);
+    };
+  }, []);
 
   useEffect(() => {
     setPan({ x: 0, y: 0 });
+    setZoom(1);
     setIsDragging(false);
     dragStateRef.current.active = false;
     dragStateRef.current.moved = false;
@@ -295,19 +758,20 @@ function AttentionOverview({
   return (
     <div className="relative h-full w-full overflow-hidden">
       <div
+        ref={containerRef}
         className={`absolute inset-0 flex items-center justify-center ${isDragging ? 'cursor-grabbing' : 'cursor-grab'}`}
         style={{ perspective: '1500px' }}
         onPointerDown={handlePointerDown}
         onPointerMove={handlePointerMove}
         onPointerUp={handlePointerUp}
         onPointerCancel={handlePointerUp}
-        onDoubleClick={() => setPan({ x: 0, y: 0 })}
+        onDoubleClick={() => { setPan({ x: 0, y: 0 }); setZoom(1); }}
       >
         <div
           className="relative h-[128%] w-[132%]"
           style={{
             transformStyle: 'preserve-3d',
-            transform: `translate(${pan.x}px, ${pan.y}px) scale(${stageScale}) rotateX(57deg) rotateZ(-10deg)`,
+            transform: `translate(${pan.x}px, ${pan.y}px) scale(${stageScale * zoom}) rotateX(57deg) rotateZ(-10deg)`,
           }}
         >
           {Array.from({ length: safeLayers }).map((_, layerIndex) => (
@@ -350,6 +814,36 @@ function AttentionOverview({
       <div className="pointer-events-none absolute right-2 top-2 rounded bg-black/65 px-2 py-1 text-[11px] text-cyan-200">
         {hoverLabel}
       </div>
+
+      {/* Zoom slider */}
+      <div className="pointer-events-auto absolute bottom-3 right-3 flex items-center gap-2 rounded-lg bg-black/70 px-3 py-1.5 backdrop-blur-sm">
+        <button
+          type="button"
+          className="text-xs text-muted-foreground hover:text-white transition-colors"
+          onClick={() => setZoom((prev) => Math.max(0.2, prev / 1.3))}
+        >
+          −
+        </button>
+        <Slider
+          min={0.2}
+          max={5}
+          step={0.05}
+          value={[zoom]}
+          className="w-24"
+          onValueChange={(val) => {
+            const v = typeof val === 'number' ? val : Array.isArray(val) ? val[0] : undefined;
+            if (typeof v === 'number') setZoom(v);
+          }}
+        />
+        <button
+          type="button"
+          className="text-xs text-muted-foreground hover:text-white transition-colors"
+          onClick={() => setZoom((prev) => Math.min(5, prev * 1.3))}
+        >
+          +
+        </button>
+        <span className="ml-1 min-w-8 text-right text-[10px] text-muted-foreground">{Math.round(zoom * 100)}%</span>
+      </div>
     </div>
   );
 }
@@ -358,21 +852,42 @@ function SingleHeadView({
   heatmap,
   layerIndex,
   headIndex,
+  scaleMax,
   version,
+  tokens,
 }: {
   heatmap: HeadHeatmap | null;
   layerIndex: number;
   headIndex: number;
+  scaleMax?: number;
   version: number;
+  tokens?: string[];
 }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const [tooltip, setTooltip] = useState<{ x: number; y: number; row: number; col: number; value: number } | null>(null);
 
   useEffect(() => {
     if (!canvasRef.current) return;
-    paintHeatmap(canvasRef.current, heatmap);
-  }, [heatmap, version]);
+    paintHeatmap(canvasRef.current, heatmap, true, scaleMax);
+  }, [heatmap, scaleMax, version]);
 
   const size = heatmap?.size ?? 1;
+
+  const handleCanvasMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    if (!heatmap) return;
+    const rect = e.currentTarget.getBoundingClientRect();
+    const col = Math.floor(((e.clientX - rect.left) / rect.width) * size);
+    const row = Math.floor(((e.clientY - rect.top) / rect.height) * size);
+    if (row < 0 || row >= size || col < 0 || col >= size || col > row) {
+      setTooltip(null);
+      return;
+    }
+    const value = heatmap.values[row * size + col];
+    setTooltip({ x: e.clientX - rect.left, y: e.clientY - rect.top, row, col, value });
+  };
+
+  const toToken = tokens?.[tooltip?.row ?? -1];
+  const fromToken = tokens?.[tooltip?.col ?? -1];
 
   return (
     <div className="relative flex h-full w-full items-center justify-center overflow-hidden p-2">
@@ -382,10 +897,27 @@ function SingleHeadView({
           width={size}
           height={size}
           className="h-full w-full rounded border border-cyan-300/40 bg-black [image-rendering:pixelated]"
+          onMouseMove={handleCanvasMouseMove}
+          onMouseLeave={() => setTooltip(null)}
         />
         <div className="pointer-events-none absolute left-2 top-2 rounded bg-black/65 px-2 py-1 text-[11px] text-cyan-200">
           Layer {layerIndex + 1} • Head {headIndex + 1}
         </div>
+        {tooltip && (
+          <div
+            className="pointer-events-none absolute z-50 rounded bg-black/85 px-2 py-1.5 text-[10px] leading-snug text-white shadow-lg backdrop-blur-sm border border-white/10"
+            style={{ left: tooltip.x + 12, top: tooltip.y - 8, maxWidth: 220 }}
+          >
+            <div className="flex items-center gap-1.5">
+              <span className="font-mono text-cyan-300">{fromToken ?? `[${tooltip.col}]`}</span>
+              <span className="text-white/40">→</span>
+              <span className="font-mono text-cyan-300">{toToken ?? `[${tooltip.row}]`}</span>
+            </div>
+            <div className="mt-0.5 text-white/60">
+              intensity: <span className="text-cyan-200 font-mono">{tooltip.value.toFixed(4)}</span>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );
@@ -394,26 +926,32 @@ function SingleHeadView({
 function LayerOverview({
   layerHeatmaps,
   heads,
+  scaleMax,
   version,
   selectedHeadIndex,
   onPickHead,
+  tokens,
 }: {
   layerHeatmaps: HeadHeatmap[] | undefined;
   heads: number;
+  scaleMax?: number;
   version: number;
   selectedHeadIndex: number;
   onPickHead?: (headIndex: number) => void;
+  tokens?: string[];
 }) {
   const canvasRefs = useRef<Array<HTMLCanvasElement | null>>([]);
   const safeHeads = Math.max(1, heads);
+  const [tooltip, setTooltip] = useState<{ x: number; y: number; headIndex: number; row: number; col: number; value: number } | null>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     for (let headIndex = 0; headIndex < safeHeads; headIndex++) {
       const canvas = canvasRefs.current[headIndex];
       if (!canvas) continue;
-      paintHeatmap(canvas, layerHeatmaps?.[headIndex] ?? null);
+      paintHeatmap(canvas, layerHeatmaps?.[headIndex] ?? null, true, scaleMax);
     }
-  }, [layerHeatmaps, safeHeads, version]);
+  }, [layerHeatmaps, safeHeads, scaleMax, version]);
 
   const columns =
     safeHeads >= 28 ? 8 :
@@ -422,8 +960,31 @@ function LayerOverview({
     safeHeads >= 6 ? 4 :
     safeHeads;
 
+  const handleHeadMouseMove = (e: React.MouseEvent<HTMLCanvasElement>, headIndex: number) => {
+    const heatmap = layerHeatmaps?.[headIndex];
+    if (!heatmap || !containerRef.current) return;
+    const rect = e.currentTarget.getBoundingClientRect();
+    const containerRect = containerRef.current.getBoundingClientRect();
+    const size = heatmap.size;
+    const col = Math.floor(((e.clientX - rect.left) / rect.width) * size);
+    const row = Math.floor(((e.clientY - rect.top) / rect.height) * size);
+    if (row < 0 || row >= size || col < 0 || col >= size || col > row) {
+      setTooltip(null);
+      return;
+    }
+    const value = heatmap.values[row * size + col];
+    setTooltip({
+      x: e.clientX - containerRect.left,
+      y: e.clientY - containerRect.top,
+      headIndex, row, col, value,
+    });
+  };
+
+  const toToken = tokens?.[tooltip?.row ?? -1];
+  const fromToken = tokens?.[tooltip?.col ?? -1];
+
   return (
-    <div className="h-full w-full overflow-hidden p-2">
+    <div ref={containerRef} className="relative h-full w-full overflow-hidden p-2">
       <div
         className="grid h-full w-full gap-2"
         style={{
@@ -447,6 +1008,8 @@ function LayerOverview({
                 canvasRefs.current[headIndex] = node;
               }}
               className="h-full w-full [image-rendering:pixelated]"
+              onMouseMove={(e) => handleHeadMouseMove(e, headIndex)}
+              onMouseLeave={() => setTooltip(null)}
             />
             <div className="pointer-events-none absolute left-1 top-1 rounded bg-black/70 px-1 py-0.5 text-[10px] text-cyan-200">
               H{headIndex + 1}
@@ -454,6 +1017,22 @@ function LayerOverview({
           </button>
         ))}
       </div>
+      {tooltip && (
+        <div
+          className="pointer-events-none absolute z-50 rounded bg-black/85 px-2 py-1.5 text-[10px] leading-snug text-white shadow-lg backdrop-blur-sm border border-white/10"
+          style={{ left: tooltip.x + 12, top: tooltip.y - 8, maxWidth: 220 }}
+        >
+          <div className="text-white/50 mb-0.5">Head {tooltip.headIndex + 1}</div>
+          <div className="flex items-center gap-1.5">
+            <span className="font-mono text-cyan-300">{fromToken ?? `[${tooltip.col}]`}</span>
+            <span className="text-white/40">→</span>
+            <span className="font-mono text-cyan-300">{toToken ?? `[${tooltip.row}]`}</span>
+          </div>
+          <div className="mt-0.5 text-white/60">
+            intensity: <span className="text-cyan-200 font-mono">{tooltip.value.toFixed(4)}</span>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -468,6 +1047,14 @@ export default function App() {
   const [selectedLayerIndex, setSelectedLayerIndex] = useState(0);
   const [selectedHeadIndex, setSelectedHeadIndex] = useState(0);
   const [showAttentionMeta, setShowAttentionMeta] = useState(false);
+  const [useGlobalScale, setUseGlobalScale] = useState(true);
+  const [availableModels, setAvailableModels] = useState<string[]>([]);
+  const [selectedModelOption, setSelectedModelOption] = useState('');
+  const [customModelName, setCustomModelName] = useState('');
+  const [activeModelName, setActiveModelName] = useState('');
+  const [modelStatus, setModelStatus] = useState('');
+  const [isLoadingModels, setIsLoadingModels] = useState(false);
+  const [isSwitchingModel, setIsSwitchingModel] = useState(false);
   const [aiAnswer, setAiAnswer] = useState<string | null>(null);
   const [aiSources, setAiSources] = useState<QuerySource[]>([]);
   const [isQuerying, setIsQuerying] = useState(false);
@@ -483,11 +1070,24 @@ export default function App() {
   const [hasUploadedPdf, setHasUploadedPdf] = useState(false);
   const [pendingUploadFile, setPendingUploadFile] = useState<File | null>(null);
   const [isScreenWideEnough, setIsScreenWideEnough] = useState(true);
+  const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const [analysisResult, setAnalysisResult] = useState<string | null>(null);
+  const [analysisPrompt, setAnalysisPrompt] = useState('Analyze this attention heatmap. Describe what patterns you see in the attention weights, which tokens attend to which, and any notable structure.');
+  const [queryCardOffset, setQueryCardOffset] = useState({ x: 0, y: 0 });
+  const [isQueryCardDragging, setIsQueryCardDragging] = useState(false);
   const wsRef = useRef<WebSocket | null>(null);
   const heatmapsRef = useRef<HeadHeatmap[][]>([]);
   const seqLenRef = useRef(0);
   const totalLayersRef = useRef(0);
   const totalHeadsRef = useRef(0);
+  const queryCardDragRef = useRef({
+    active: false,
+    pointerId: -1,
+    startX: 0,
+    startY: 0,
+    originX: 0,
+    originY: 0,
+  });
   const { nodes, edges, isLoading, setLoading, setActiveNodes, setAiSourceNodes, selectedNodeId, setSelectedNode, loadGraph } = useAppStore();
 
   const pinSourceNodes = useCallback((sources: QuerySource[]) => {
@@ -525,7 +1125,127 @@ export default function App() {
     setTotalLayers(0);
     setTotalHeads(0);
     setHeatmapVersion((v) => v + 1);
+    setAnalysisResult(null);
   }, []);
+
+  const handleAnalyzeHeatmap = useCallback(async () => {
+    if (isAnalyzing || !process.env.NEXT_PUBLIC_HOSTNAME) return;
+
+    // Find the visible heatmap canvas inside the attention popover
+    const popover = document.querySelector('[data-slot="attention-popover"]');
+    if (!popover) return;
+
+    // Grab all heatmap canvases currently rendered in the visualization area
+    const canvases = popover.querySelectorAll<HTMLCanvasElement>('[data-slot="attention-viz"] canvas');
+    if (canvases.length === 0) return;
+
+    // Composite all visible canvases into one image
+    const compositeCanvas = document.createElement('canvas');
+    const ctx = compositeCanvas.getContext('2d');
+    if (!ctx) return;
+
+    if (canvases.length === 1) {
+      // Single canvas — just export it directly
+      const src = canvases[0];
+      compositeCanvas.width = src.width;
+      compositeCanvas.height = src.height;
+      ctx.drawImage(src, 0, 0);
+    } else {
+      // Multiple canvases (layer/grid view) — tile them into a composite
+      const gap = 2;
+      const cols = Math.min(canvases.length, 6);
+      const rows = Math.ceil(canvases.length / cols);
+      const tileW = canvases[0].width || 64;
+      const tileH = canvases[0].height || 64;
+      compositeCanvas.width = cols * tileW + (cols - 1) * gap;
+      compositeCanvas.height = rows * tileH + (rows - 1) * gap;
+      ctx.fillStyle = '#000';
+      ctx.fillRect(0, 0, compositeCanvas.width, compositeCanvas.height);
+      canvases.forEach((c, i) => {
+        const col = i % cols;
+        const row = Math.floor(i / cols);
+        ctx.drawImage(c, col * (tileW + gap), row * (tileH + gap), tileW, tileH);
+      });
+    }
+
+    setIsAnalyzing(true);
+    setAnalysisResult(null);
+
+    try {
+      const blob = await new Promise<Blob | null>((resolve) =>
+        compositeCanvas.toBlob(resolve, 'image/png')
+      );
+      if (!blob) {
+        setAnalysisResult('Failed to capture heatmap image.');
+        setIsAnalyzing(false);
+        return;
+      }
+
+      // Build context about the current view
+      const contextParts: string[] = [];
+
+      // View mode and selection
+      if (attentionViewMode === 'single') {
+        contextParts.push(`Viewing: Single head — Layer ${selectedLayerIndex + 1}/${totalLayers}, Head ${selectedHeadIndex + 1}/${totalHeads}`);
+      } else if (attentionViewMode === 'layer') {
+        contextParts.push(`Viewing: All ${totalHeads} heads of Layer ${selectedLayerIndex + 1}/${totalLayers}`);
+      } else {
+        contextParts.push(`Viewing: 3D stack of all ${totalLayers} layers × ${totalHeads} heads`);
+      }
+
+      contextParts.push(`Sequence length: ${seqLen} tokens`);
+      contextParts.push(`Scale: ${useGlobalScale ? 'global (0–1)' : 'local (per-head max)'}`);
+
+      // Token list
+      if (promptTokens.length > 0) {
+        contextParts.push(`\nToken sequence (${promptTokens.length} tokens):\n${promptTokens.map((t, i) => `  [${i}] "${t}"`).join('\n')}`);
+      }
+
+      // Generated tokens
+      if (generatedTokens.length > 0) {
+        contextParts.push(`\nGenerated tokens (${generatedTokens.length}): ${generatedTokens.join(' ')}`);
+      }
+
+      // Heatmap statistics for current view
+      if (attentionViewMode === 'single') {
+        const heatmap = heatmapsRef.current[selectedLayerIndex]?.[selectedHeadIndex];
+        if (heatmap) {
+          const peak = getPositivePeak(heatmap.values);
+          let sum = 0;
+          let count = 0;
+          for (let r = 0; r < heatmap.size; r++) {
+            for (let c = 0; c <= r; c++) {
+              const v = heatmap.values[r * heatmap.size + c];
+              if (Number.isFinite(v) && v > 0) { sum += v; count++; }
+            }
+          }
+          contextParts.push(`\nHeatmap stats: peak=${peak.toFixed(4)}, mean=${count > 0 ? (sum / count).toFixed(4) : '0'}, active_cells=${count}`);
+        }
+      }
+
+      const enrichedPrompt = `${contextParts.join('\n')}\n\n---\nUser prompt: ${analysisPrompt}`;
+
+      const formData = new FormData();
+      formData.append('image', blob, 'attention_heatmap.png');
+      formData.append('prompt', enrichedPrompt);
+
+      const res = await fetch(`https://${process.env.NEXT_PUBLIC_HOSTNAME}/image_analysis`, {
+        method: 'POST',
+        body: formData,
+      });
+
+      const data = await res.json();
+      if (typeof data?.analysis === 'string') {
+        setAnalysisResult(data.analysis);
+      } else {
+        setAnalysisResult('No analysis returned from the server.');
+      }
+    } catch {
+      setAnalysisResult('Failed to connect to analysis service.');
+    } finally {
+      setIsAnalyzing(false);
+    }
+  }, [isAnalyzing, analysisPrompt]);
 
   const handleAiQuery = useCallback(() => {
     if (!aiQuery.trim() || isQuerying) return;
@@ -553,7 +1273,7 @@ export default function App() {
 
     ws.onopen = () => {
       setAttentionStatus('Connected. Streaming attention heads...');
-      ws.send(JSON.stringify({ query: aiQuery.trim(), k: aiK, max_tokens: maxTokens }));
+      ws.send(JSON.stringify({ query: aiQuery.trim(), k: aiK }));
     };
 
     ws.onmessage = (event) => {
@@ -755,11 +1475,9 @@ export default function App() {
           setAiAnswer(answer);
           setAiSources(sources);
           pinSourceNodes(sources);
-          setAttentionStatus('Answer received.');
+          setAttentionStatus('Answer received. Generation complete.');
           completed = true;
           setIsQuerying(false);
-          setIsAttentionPopoverOpen(false);
-          resetAttentionState();
           ws.close();
           return;
         }
@@ -792,8 +1510,6 @@ export default function App() {
           setAttentionStatus(`Attention complete: ${layers} layers x ${heads} heads.`);
           completed = true;
           setIsQuerying(false);
-          setIsAttentionPopoverOpen(false);
-          resetAttentionState();
           ws.close();
         }
       } catch {
@@ -829,6 +1545,97 @@ export default function App() {
   ]);
 
   const API_BASE = `https://${process.env.NEXT_PUBLIC_HOSTNAME}`;
+
+  const fetchAvailableModels = useCallback(async () => {
+    if (!process.env.NEXT_PUBLIC_HOSTNAME) {
+      setModelStatus('Missing NEXT_PUBLIC_HOSTNAME.');
+      return;
+    }
+
+    setIsLoadingModels(true);
+    try {
+      const response = await fetch(`${API_BASE}/aval_model`, { cache: 'no-store' });
+      const payload = await response.json();
+      const incomingModels =
+        isRecord(payload) && Array.isArray(payload.available_models)
+          ? payload.available_models
+              .filter((model): model is string => typeof model === 'string')
+              .map((model) => model.trim())
+              .filter((model) => model.length > 0)
+          : [];
+
+      const uniqueModels = [...new Set(incomingModels)];
+      setAvailableModels(uniqueModels);
+      setSelectedModelOption((prev) => {
+        if (ALLOW_CUSTOM_MODEL && prev === CUSTOM_MODEL_OPTION) return prev;
+        if (prev && uniqueModels.includes(prev)) return prev;
+        return uniqueModels[0] ?? '';
+      });
+
+      if (uniqueModels.length === 0) {
+        setModelStatus('No models returned by /aval_model.');
+      } else {
+        setModelStatus(`Loaded ${uniqueModels.length} models.`);
+      }
+    } catch (error) {
+      console.error('Failed to fetch available models:', error);
+      setModelStatus('Failed to load models.');
+    } finally {
+      setIsLoadingModels(false);
+    }
+  }, [API_BASE]);
+
+  const handleChooseModel = useCallback(async () => {
+    const isCustomOptionSelected = selectedModelOption === CUSTOM_MODEL_OPTION;
+    const modelName =
+      ALLOW_CUSTOM_MODEL && isCustomOptionSelected
+        ? customModelName.trim()
+        : isCustomOptionSelected
+          ? ''
+          : selectedModelOption.trim();
+
+    if (!modelName) {
+      setModelStatus(ALLOW_CUSTOM_MODEL
+        ? 'Select a model or enter a custom model name.'
+        : 'Select a model.'
+      );
+      return;
+    }
+    if (!process.env.NEXT_PUBLIC_HOSTNAME) {
+      setModelStatus('Missing NEXT_PUBLIC_HOSTNAME.');
+      return;
+    }
+
+    setIsSwitchingModel(true);
+    try {
+      const response = await fetch(`${API_BASE}/choose_llm`, {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          model_name: modelName,
+        }),
+      });
+
+      const payload = await response.json();
+      const status = isRecord(payload) && typeof payload.status === 'string' ? payload.status : '';
+      const detail = isRecord(payload) && typeof payload.detail === 'string' ? payload.detail : '';
+
+      if (!response.ok || (status !== '' && status !== 'ok')) {
+        setModelStatus(detail ? `Failed to switch model: ${detail}` : 'Failed to switch model.');
+        return;
+      }
+
+      setActiveModelName(modelName);
+      setModelStatus(`Using model: ${modelName}`);
+    } catch (error) {
+      console.error('Failed to switch model:', error);
+      setModelStatus('Failed to switch model.');
+    } finally {
+      setIsSwitchingModel(false);
+    }
+  }, [API_BASE, customModelName, selectedModelOption]);
 
   const handleLoadGraph = useCallback(async () => {
     setLoading(true);
@@ -921,6 +1728,10 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    void fetchAvailableModels();
+  }, [fetchAvailableModels]);
+
+  useEffect(() => {
     setSelectedLayerIndex((prev) => Math.max(0, Math.min(prev, Math.max(totalLayers - 1, 0))));
   }, [totalLayers]);
 
@@ -932,6 +1743,48 @@ export default function App() {
   const maxHeadIndex = Math.max(totalHeads - 1, 0);
   const activeLayerIndex = Math.max(0, Math.min(selectedLayerIndex, maxLayerIndex));
   const activeHeadIndex = Math.max(0, Math.min(selectedHeadIndex, maxHeadIndex));
+  const selectedNode = selectedNodeId ? nodes.find((n) => n.id === selectedNodeId) ?? null : null;
+  const isCustomOptionSelected = selectedModelOption === CUSTOM_MODEL_OPTION;
+  const pendingModelName =
+    ALLOW_CUSTOM_MODEL && isCustomOptionSelected
+      ? customModelName.trim()
+      : isCustomOptionSelected
+        ? ''
+        : selectedModelOption.trim();
+  const attentionScaleMax = useGlobalScale ? 1 : undefined;
+
+  const handleQueryCardDragStart = (event: React.PointerEvent<HTMLDivElement>) => {
+    queryCardDragRef.current = {
+      active: true,
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      originX: queryCardOffset.x,
+      originY: queryCardOffset.y,
+    };
+    setIsQueryCardDragging(true);
+    event.currentTarget.setPointerCapture(event.pointerId);
+  };
+
+  const handleQueryCardDragMove = (event: React.PointerEvent<HTMLDivElement>) => {
+    const dragState = queryCardDragRef.current;
+    if (!dragState.active || dragState.pointerId !== event.pointerId) return;
+
+    const dx = event.clientX - dragState.startX;
+    const dy = event.clientY - dragState.startY;
+    setQueryCardOffset({ x: dragState.originX + dx, y: dragState.originY + dy });
+  };
+
+  const handleQueryCardDragEnd = (event: React.PointerEvent<HTMLDivElement>) => {
+    const dragState = queryCardDragRef.current;
+    if (!dragState.active || dragState.pointerId !== event.pointerId) return;
+
+    queryCardDragRef.current.active = false;
+    setIsQueryCardDragging(false);
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+  };
 
   if (!isScreenWideEnough) {
     return (
@@ -954,101 +1807,205 @@ export default function App() {
       </div>
 
       {/* LAYER 2: HTML UI Overlay */}
-      <div className="pointer-events-none absolute inset-0 z-10 flex flex-col justify-between p-6">
-        {/* Top Header */}
-        <div className="pointer-events-auto w-[min(360px,100%)]">
-          <Card className="bg-black/60 backdrop-blur-xl border-white/10">
-            <CardHeader className="pb-2">
-              <CardTitle className="text-2xl font-bold text-white">AI Data Visualizer</CardTitle>
-              <p className="text-sm text-muted-foreground">Rotate to explore the latent space.</p>
-            </CardHeader>
-            <CardContent className="pt-0">
-              <p className="text-xs text-muted-foreground">Nodes in scene: {nodes.length}</p>
-              <p className="mt-1 text-xs text-muted-foreground">Attention: {attentionStatus}</p>
-            </CardContent>
-          </Card>
-        </div>
+      <div className="pointer-events-none absolute inset-0 z-30 p-6">
+        <div className="relative h-full w-full">
+          {/* Top Header */}
+          <div className="pointer-events-auto w-[min(360px,100%)]">
+            <SpotlightCard className="rounded-xl">
+              <Card className="bg-black/60 backdrop-blur-xl border-white/10">
+                <CardHeader className="pb-2">
+                  <CardTitle className="text-2xl font-bold text-white">Cognitive Cartographer</CardTitle>
+                  <p className="text-sm text-muted-foreground">Rotate to explore the latent space.</p>
+                </CardHeader>
+                <CardContent className="pt-0">
+                  <p className="text-xs text-muted-foreground">Nodes in scene: {nodes.length}</p>
+                  <p className="mt-1 text-xs text-muted-foreground">Attention: {attentionStatus}</p>
+                </CardContent>
+              </Card>
+            </SpotlightCard>
+          </div>
 
-        {/* Bottom Controls */}
-        <div className="flex items-end justify-between gap-4 flex-wrap">
-          {/* Upload Panel */}
-          <Card className="pointer-events-auto w-[min(360px,100%)] bg-black/60 backdrop-blur-xl border-white/10">
-            <CardContent className="p-3">
-              <FileUpload className="p-4" onChange={handleUploadFileSelection} />
-              <p className="mt-2 min-h-4.5 px-1 text-xs text-muted-foreground">
-                {isUploading ? `Uploading: ${uploadStatus}` : uploadStatus}
-              </p>
-              <Button
-                className="mt-2 w-full"
-                variant={isUploading || !pendingUploadFile ? 'secondary' : 'default'}
-                disabled={isUploading || !pendingUploadFile}
-                onClick={handleConfirmUpload}
-              >
-                {isUploading ? 'Uploading...' : 'Confirm Upload'}
-              </Button>
-            </CardContent>
-          </Card>
+          {/* Bottom-left Upload / AI Answer */}
+          <div className="pointer-events-auto absolute bottom-0 left-0 w-[min(360px,100%)]">
+            {aiAnswer !== null ? (
+              <Card className="flex h-[min(400px,calc(100vh-200px))] flex-col overflow-hidden bg-black/60 backdrop-blur-xl border-white/10">
+                <CardHeader className="shrink-0 pb-0">
+                  <div className="flex items-center justify-between">
+                    <CardTitle className="text-xs font-medium uppercase tracking-widest text-muted-foreground">
+                      AI Answer
+                    </CardTitle>
+                    <Button
+                      variant="ghost"
+                      size="icon-xs"
+                      className="text-white/70 hover:text-white"
+                      onClick={() => {
+                        setAiAnswer(null);
+                        setAiSources([]);
+                        setAiSourceNodes([]);
+                        setActiveNodes([]);
+                      }}
+                    >
+                      ✕
+                    </Button>
+                  </div>
+                </CardHeader>
+                <ScrollArea style={{ height: 'calc(100% - 24px)' }}>
+                  <CardContent className="pb-4">
+                    <TextGenerateEffect text={aiAnswer} />
 
-          {/* Center Controls */}
-          <div className="flex flex-wrap items-end justify-center gap-3">
-            {/* Load Graph */}
-            <Card className="pointer-events-auto bg-black/60 backdrop-blur-xl border-white/10">
-              <CardContent className="p-3">
-                <Button
-                  variant={isLoading || isUploading || !hasUploadedPdf ? 'secondary' : 'default'}
-                  disabled={isLoading || isUploading || !hasUploadedPdf}
-                  onClick={handleLoadGraph}
-                  className="bg-cyan-500 text-black hover:bg-cyan-400 disabled:bg-secondary disabled:text-muted-foreground"
-                >
-                  {isLoading ? 'Loading...' : 'Load Graph'}
-                </Button>
-              </CardContent>
-            </Card>
-
-            {/* Search */}
-            <Card className="pointer-events-auto bg-black/60 backdrop-blur-xl border-white/10">
-              <CardContent className="p-3">
-                <form
-                  className="flex gap-2"
-                  onSubmit={(e) => {
-                    e.preventDefault();
-                    if (!queryText) return;
-                    const { nodes: currentNodes, edges: currentEdges } = useAppStore.getState();
-                    const query = queryText.toLowerCase();
-                    const matched = currentNodes.filter((n) =>
-                      n.label.toLowerCase().includes(query) || n.text.toLowerCase().includes(query)
-                    );
-                    if (matched.length === 0) {
-                      setActiveNodes([]);
-                      return;
-                    }
-                    const matchedIds = new Set(matched.map((n) => n.id));
-                    for (const edge of currentEdges) {
-                      if (matchedIds.has(edge.sourceId)) matchedIds.add(edge.targetId);
-                      if (matchedIds.has(edge.targetId)) matchedIds.add(edge.sourceId);
-                    }
-                    setActiveNodes([...matchedIds]);
-                  }}
-                >
-                  <Input
-                    placeholder="Search nodes..."
-                    value={queryText}
-                    onChange={(e) => setQueryText(e.target.value)}
-                    className="w-50 bg-black/50 border-white/10 text-white placeholder:text-white/40"
-                  />
+                    {aiSources.length > 0 && (
+                      <>
+                        <Separator className="my-3 bg-white/10" />
+                        <h4 className="mb-2 text-xs font-medium uppercase tracking-widest text-muted-foreground">
+                          Sources ({aiSources.length})
+                        </h4>
+                        <div className="flex flex-col gap-2">
+                          {aiSources.map((src, i) => {
+                            const matchedNode = nodes.find((n) => n.text === src.text);
+                            return (
+                              <div
+                                key={i}
+                                onClick={() => {
+                                  if (matchedNode) {
+                                    const clusterIds = new Set<string>([matchedNode.id]);
+                                    for (const edge of edges) {
+                                      if (edge.sourceId === matchedNode.id) clusterIds.add(edge.targetId);
+                                      if (edge.targetId === matchedNode.id) clusterIds.add(edge.sourceId);
+                                    }
+                                    const { activeNodeIds } = useAppStore.getState();
+                                    const mergedIds = new Set<string>([...activeNodeIds, ...clusterIds]);
+                                    setActiveNodes([...mergedIds]);
+                                    setSelectedNode(matchedNode.id);
+                                  }
+                                }}
+                                className={`rounded-lg p-2.5 text-xs transition-colors ${
+                                  matchedNode
+                                    ? 'cursor-pointer bg-white/5 border border-purple-500/30 hover:bg-white/10'
+                                    : 'bg-white/5 border border-transparent'
+                                }`}
+                              >
+                                <div className="mb-1 flex items-center gap-1.5 text-muted-foreground">
+                                  {matchedNode && (
+                                    <div
+                                      className="size-1.5 shrink-0 rounded-full"
+                                      style={{ background: matchedNode.color }}
+                                    />
+                                  )}
+                                  <span>{src.metadata.source}</span>
+                                  {matchedNode && (
+                                    <span className="opacity-70">— {matchedNode.label}</span>
+                                  )}
+                                </div>
+                                <p className="leading-relaxed text-white/80">
+                                  {src.text.length > 200 ? src.text.slice(0, 200) + '...' : src.text}
+                                </p>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </>
+                    )}
+                  </CardContent>
+                </ScrollArea>
+              </Card>
+            ) : (
+              <Card className="bg-black/60 backdrop-blur-xl border-white/10">
+                <CardContent className="p-3">
+                  <FileUpload className="p-4" onChange={handleUploadFileSelection} />
+                  <p className="mt-2 min-h-4.5 px-1 text-xs text-muted-foreground">
+                    {isUploading ? `Uploading: ${uploadStatus}` : uploadStatus}
+                  </p>
                   <Button
-                    type="submit"
-                    disabled={nodes.length === 0}
-                    className="bg-orange-500 text-white hover:bg-orange-400 disabled:bg-secondary disabled:text-muted-foreground"
+                    className="mt-2 w-full"
+                    variant={isUploading || !pendingUploadFile ? 'secondary' : 'default'}
+                    disabled={isUploading || !pendingUploadFile}
+                    onClick={handleConfirmUpload}
                   >
-                    Search
+                    {isUploading ? 'Uploading...' : 'Confirm Upload'}
                   </Button>
-                </form>
-              </CardContent>
-            </Card>
+                </CardContent>
+              </Card>
+            )}
+          </div>
 
-            {/* AI Query */}
-            <Card className="pointer-events-auto bg-black/60 backdrop-blur-xl border-white/10">
+          {/* Bottom-Centered Load + Search */}
+          <div className="pointer-events-none absolute bottom-0 left-1/2 -translate-x-1/2">
+            <div className="pointer-events-auto flex flex-wrap items-end justify-center gap-3">
+              <Card className="bg-black/60 backdrop-blur-xl border-white/10">
+                <CardContent className="p-3">
+                  <Button
+                    variant={isLoading || isUploading || !hasUploadedPdf ? 'secondary' : 'default'}
+                    disabled={isLoading || isUploading || !hasUploadedPdf}
+                    onClick={handleLoadGraph}
+                    className="bg-cyan-500 text-black hover:bg-cyan-400 disabled:bg-secondary disabled:text-muted-foreground"
+                  >
+                    {isLoading ? 'Loading...' : 'Load Graph'}
+                  </Button>
+                </CardContent>
+              </Card>
+
+              <Card className="bg-black/60 backdrop-blur-xl border-white/10">
+                <CardContent className="p-3">
+                  <form
+                    className="flex gap-2"
+                    onSubmit={(e) => {
+                      e.preventDefault();
+                      if (!queryText) return;
+                      const { nodes: currentNodes, edges: currentEdges } = useAppStore.getState();
+                      const query = queryText.toLowerCase();
+                      const matched = currentNodes.filter((n) =>
+                        n.label.toLowerCase().includes(query) || n.text.toLowerCase().includes(query)
+                      );
+                      if (matched.length === 0) {
+                        setActiveNodes([]);
+                        return;
+                      }
+                      const matchedIds = new Set(matched.map((n) => n.id));
+                      for (const edge of currentEdges) {
+                        if (matchedIds.has(edge.sourceId)) matchedIds.add(edge.targetId);
+                        if (matchedIds.has(edge.targetId)) matchedIds.add(edge.sourceId);
+                      }
+                      setActiveNodes([...matchedIds]);
+                    }}
+                  >
+                    <Input
+                      placeholder="Search nodes..."
+                      value={queryText}
+                      onChange={(e) => setQueryText(e.target.value)}
+                      className="w-50 bg-black/50 border-white/10 text-white placeholder:text-white/40"
+                    />
+                    <Button
+                      type="submit"
+                      disabled={nodes.length === 0}
+                      className="bg-orange-500 text-white hover:bg-orange-400 disabled:bg-secondary disabled:text-muted-foreground"
+                    >
+                      Search
+                    </Button>
+                  </form>
+                </CardContent>
+              </Card>
+            </div>
+          </div>
+
+          {/* Draggable Query / Model Card */}
+          <div
+            className="pointer-events-auto absolute bottom-0 right-0 z-40"
+            style={{ transform: `translate(${queryCardOffset.x}px, ${queryCardOffset.y}px)` }}
+          >
+            <div
+              className={`mb-2 flex touch-none select-none items-center justify-between rounded border border-white/10 bg-black/60 px-2 py-1 text-[10px] uppercase tracking-widest text-muted-foreground ${
+                isQueryCardDragging ? 'cursor-grabbing' : 'cursor-grab'
+              }`}
+              onPointerDown={handleQueryCardDragStart}
+              onPointerMove={handleQueryCardDragMove}
+              onPointerUp={handleQueryCardDragEnd}
+              onPointerCancel={handleQueryCardDragEnd}
+            >
+              <span>Query + Model</span>
+              <span>Drag</span>
+            </div>
+
+            <GlowingBorder glowColor="rgba(168, 85, 247, 0.4)">
               <CardContent className="p-3">
                 <form
                   className="flex items-start gap-2"
@@ -1064,6 +2021,68 @@ export default function App() {
                       onChange={(e) => setAiQuery(e.target.value)}
                       className="w-72 bg-black/50 border-white/10 text-white placeholder:text-white/40"
                     />
+
+                    <div className="flex items-center gap-2">
+                      <span className="shrink-0 text-xs text-muted-foreground">model:</span>
+                      <Select
+                        value={selectedModelOption}
+                        onValueChange={(val) => setSelectedModelOption(val as string)}
+                        disabled={isLoadingModels || isSwitchingModel}
+                      >
+                        <SelectTrigger size="sm" className="w-52 bg-black/50 border-white/10 text-xs text-white">
+                          <SelectValue placeholder="No models loaded" />
+                        </SelectTrigger>
+                        <SelectContent className="bg-[#1a1a2e] border-white/10">
+                          {availableModels.map((modelName) => (
+                            <SelectItem key={modelName} value={modelName}>
+                              {modelName}
+                            </SelectItem>
+                          ))}
+                          {ALLOW_CUSTOM_MODEL && (
+                            <SelectItem value={CUSTOM_MODEL_OPTION}>Custom model...</SelectItem>
+                          )}
+                        </SelectContent>
+                      </Select>
+
+                      <Button
+                        type="button"
+                        size="xs"
+                        variant="secondary"
+                        disabled={isLoadingModels || isSwitchingModel}
+                        onClick={() => void fetchAvailableModels()}
+                      >
+                        {isLoadingModels ? 'Loading...' : 'Refresh'}
+                      </Button>
+                    </div>
+
+                    {ALLOW_CUSTOM_MODEL && selectedModelOption === CUSTOM_MODEL_OPTION && (
+                      <Input
+                        placeholder="Enter custom model name..."
+                        value={customModelName}
+                        onChange={(e) => setCustomModelName(e.target.value)}
+                        className="w-72 bg-black/50 border-white/10 text-white placeholder:text-white/40"
+                      />
+                    )}
+
+                    <div className="flex items-center gap-2">
+                      <Button
+                        type="button"
+                        size="xs"
+                        variant="secondary"
+                        disabled={isSwitchingModel || pendingModelName.length === 0}
+                        onClick={() => void handleChooseModel()}
+                      >
+                        {isSwitchingModel ? 'Switching...' : 'Use Model'}
+                      </Button>
+                      <span className="max-w-52 truncate text-xs text-muted-foreground">
+                        {modelStatus || (activeModelName
+                          ? `Using model: ${activeModelName}`
+                          : ALLOW_CUSTOM_MODEL
+                            ? 'No model selected'
+                            : 'No model selected (custom disabled)')}
+                      </span>
+                    </div>
+
                     <div className="flex items-center gap-3">
                       <span className="shrink-0 text-xs text-muted-foreground">k: {aiK}</span>
                       <Slider
@@ -1077,299 +2096,307 @@ export default function App() {
                           else if (Array.isArray(val) && typeof val[0] === 'number') setAiK(val[0]);
                         }}
                       />
-                      <div className="flex items-center gap-1">
-                        <span className="text-xs text-muted-foreground">max:</span>
-                        <Input
-                          type="number"
-                          min={1}
-                          max={2048}
-                          value={maxTokens}
-                          onChange={(e) => setMaxTokens(toPositiveInt(e.target.value, 200))}
-                          className="h-7 w-24 bg-black/50 border-white/10 text-white"
-                        />
-                      </div>
                     </div>
                   </div>
                   <Button
                     type="submit"
-                    disabled={isQuerying || !aiQuery.trim()}
+                    disabled={isQuerying || isSwitchingModel || !aiQuery.trim()}
                     className="self-start bg-purple-500 text-white hover:bg-purple-400 disabled:bg-secondary disabled:text-muted-foreground"
                   >
                     {isQuerying ? 'Thinking...' : 'Ask AI'}
                   </Button>
                 </form>
               </CardContent>
-            </Card>
+            </GlowingBorder>
           </div>
         </div>
       </div>
 
       {/* LAYER 3: Attention Heatmap Popover */}
       {isAttentionPopoverOpen && (
-        <div className="pointer-events-auto fixed inset-0 z-40 bg-black/75 p-3 backdrop-blur-sm">
-          <Card className="flex h-full w-full flex-col overflow-hidden border-cyan-300/20 bg-black/85">
-            <CardHeader className="pb-2">
-              <div className="flex items-center justify-between gap-2">
-                <CardTitle className="text-sm font-medium uppercase tracking-widest text-muted-foreground">
-                  Attention Heads
-                </CardTitle>
-                <Button
-                  type="button"
-                  size="xs"
-                  variant="secondary"
-                  onClick={() => {
-                    if (wsRef.current) {
-                      wsRef.current.close();
-                      wsRef.current = null;
-                    }
-                    setIsQuerying(false);
-                    setIsAttentionPopoverOpen(false);
-                    setAttentionStatus('Idle');
-                    resetAttentionState();
-                  }}
-                >
-                  Close
-                </Button>
+        <div data-slot="attention-popover" className="pointer-events-auto fixed inset-0 z-40 bg-black/80 p-4 backdrop-blur-md">
+          <div className="flex h-full w-full flex-col overflow-hidden rounded-xl border border-cyan-400/15 bg-[#0a0a18]">
+            {/* Header bar */}
+            <div className="flex items-center justify-between border-b border-white/10 px-5 py-3">
+              <div className="flex items-center gap-4">
+                <h2 className="text-sm font-semibold tracking-wide text-white">Attention Heads</h2>
+                <Separator orientation="vertical" className="h-4 bg-white/15" />
+                <div className="flex gap-3 text-[11px] text-muted-foreground">
+                  <span>seq: {seqLen || '-'}</span>
+                  <span>layers: {totalLayers || '-'}</span>
+                  <span>heads: {totalHeads || '-'}</span>
+                </div>
+                <span className="text-[11px] text-cyan-300/70">{attentionStatus}</span>
               </div>
-              <p className="text-xs text-muted-foreground">{attentionStatus}</p>
-              <div className="flex flex-wrap gap-3 text-[11px] text-muted-foreground">
-                <span>seq_len: {seqLen || '-'}</span>
-                <span>layers: {totalLayers || '-'}</span>
-                <span>heads: {totalHeads || '-'}</span>
-              </div>
-            </CardHeader>
-            <CardContent className="flex min-h-0 flex-1 flex-col gap-2">
+              <Button
+                type="button"
+                size="icon-xs"
+                variant="ghost"
+                className="text-white/60 hover:text-white"
+                onClick={() => {
+                  if (wsRef.current) {
+                    wsRef.current.close();
+                    wsRef.current = null;
+                  }
+                  setIsQuerying(false);
+                  setIsAttentionPopoverOpen(false);
+                  setAttentionStatus('Idle');
+                  resetAttentionState();
+                }}
+              >
+                ✕
+              </Button>
+            </div>
+
+            {/* Controls + Visualization */}
+            <div className="flex min-h-0 flex-1">
+              {/* Left sidebar controls */}
               {totalLayers > 0 && totalHeads > 0 && (
-                <div className="flex flex-wrap items-center gap-2 rounded border border-white/10 bg-black/40 p-2">
-                  <span className="text-[11px] text-muted-foreground">View:</span>
-                  <Button
-                    type="button"
-                    size="xs"
-                    variant={attentionViewMode === 'stack' ? 'default' : 'secondary'}
-                    onClick={() => setAttentionViewMode('stack')}
-                  >
-                    3D Stack
-                  </Button>
-                  <Button
-                    type="button"
-                    size="xs"
-                    variant={attentionViewMode === 'layer' ? 'default' : 'secondary'}
-                    onClick={() => setAttentionViewMode('layer')}
-                    disabled={totalLayers <= 0}
-                  >
-                    Layer Only
-                  </Button>
-                  <Button
-                    type="button"
-                    size="xs"
-                    variant={attentionViewMode === 'single' ? 'default' : 'secondary'}
-                    onClick={() => setAttentionViewMode('single')}
-                    disabled={totalLayers <= 0 || totalHeads <= 0}
-                  >
-                    Single Head
-                  </Button>
+                <div className="flex w-48 shrink-0 flex-col gap-3 overflow-y-auto border-r border-white/10 bg-black/30 p-3">
+                  {/* View mode tabs */}
+                  <div>
+                    <p className="mb-1.5 text-[10px] font-medium uppercase tracking-widest text-muted-foreground">View</p>
+                    <div className="flex flex-col gap-0.5">
+                      {(['stack', 'layer', 'single'] as const).map((mode) => {
+                        const label = mode === 'stack' ? '3D Stack' : mode === 'layer' ? 'Layer' : 'Single Head';
+                        const disabled = mode === 'layer' ? totalLayers <= 0 : mode === 'single' ? (totalLayers <= 0 || totalHeads <= 0) : false;
+                        const active = attentionViewMode === mode;
+                        return (
+                          <button
+                            key={mode}
+                            type="button"
+                            disabled={disabled}
+                            onClick={() => setAttentionViewMode(mode)}
+                            className={`rounded px-2 py-1 text-left text-xs transition-colors ${
+                              active
+                                ? 'bg-white/10 text-white font-medium'
+                                : 'text-muted-foreground hover:text-white hover:bg-white/5'
+                            } disabled:pointer-events-none disabled:opacity-50`}
+                          >
+                            {label}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
 
-                  <span className="ml-2 text-[11px] text-muted-foreground">Layer</span>
-                  <Input
-                    type="number"
-                    min={1}
-                    max={Math.max(totalLayers, 1)}
-                    value={activeLayerIndex + 1}
-                    onChange={(e) => setSelectedLayerIndex(Math.max(0, toPositiveInt(e.target.value, 1) - 1))}
-                    className="h-7 w-20 bg-black/60 text-xs"
-                  />
+                  <Separator className="bg-white/10" />
 
-                  <span className="text-[11px] text-muted-foreground">Head</span>
-                  <Input
-                    type="number"
-                    min={1}
-                    max={Math.max(totalHeads, 1)}
-                    value={activeHeadIndex + 1}
-                    onChange={(e) => setSelectedHeadIndex(Math.max(0, toPositiveInt(e.target.value, 1) - 1))}
-                    className="h-7 w-20 bg-black/60 text-xs"
-                  />
+                  {/* Layer / Head selectors */}
+                  <div className="flex flex-col gap-2">
+                    <div>
+                      <p className="mb-1 text-[10px] font-medium uppercase tracking-widest text-muted-foreground">Layer</p>
+                      <Input
+                        type="number"
+                        min={1}
+                        max={Math.max(totalLayers, 1)}
+                        value={activeLayerIndex + 1}
+                        onChange={(e) => setSelectedLayerIndex(Math.max(0, toPositiveInt(e.target.value, 1) - 1))}
+                        className="h-7 bg-black/50 border-white/10 text-xs"
+                      />
+                    </div>
+                    <div>
+                      <p className="mb-1 text-[10px] font-medium uppercase tracking-widest text-muted-foreground">Head</p>
+                      <Input
+                        type="number"
+                        min={1}
+                        max={Math.max(totalHeads, 1)}
+                        value={activeHeadIndex + 1}
+                        onChange={(e) => setSelectedHeadIndex(Math.max(0, toPositiveInt(e.target.value, 1) - 1))}
+                        className="h-7 bg-black/50 border-white/10 text-xs"
+                      />
+                    </div>
+                  </div>
 
+                  <Separator className="bg-white/10" />
+
+                  {/* Scale toggle */}
+                  <div className="flex items-center gap-2">
+                    <Switch
+                      size="sm"
+                      checked={useGlobalScale}
+                      onCheckedChange={(checked) => setUseGlobalScale(Boolean(checked))}
+                    />
+                    <span className="text-[11px] text-muted-foreground">
+                      {useGlobalScale ? 'Global scale' : 'Local scale'}
+                    </span>
+                  </div>
+
+                  {/* Color legend */}
+                  <div className="flex items-center gap-1.5 text-[10px] text-muted-foreground">
+                    <span>0</span>
+                    <div className="h-1.5 flex-1 rounded-full bg-linear-to-r from-black to-cyan-400" />
+                    <span>{useGlobalScale ? '1.0' : 'max'}</span>
+                  </div>
+
+                  <Separator className="bg-white/10" />
+
+                  {/* Token strips toggle */}
                   <Button
                     type="button"
                     size="xs"
                     variant="secondary"
+                    className="w-full"
                     onClick={() => setShowAttentionMeta((prev) => !prev)}
                   >
-                    {showAttentionMeta ? 'Hide token strips' : 'Show token strips'}
+                    {showAttentionMeta ? 'Hide tokens' : 'Show tokens'}
                   </Button>
+
+                  <Separator className="bg-white/10" />
+
+                  {/* Analyze heatmap */}
+                  <div className="flex flex-col gap-1.5">
+                    <p className="text-[10px] font-medium uppercase tracking-widest text-muted-foreground">Analyze</p>
+                    <Textarea
+                      value={analysisPrompt}
+                      onChange={(e) => setAnalysisPrompt(e.target.value)}
+                      rows={3}
+                      className="min-h-0 max-h-20 overflow-y-auto bg-black/50 border-white/10 text-[11px] text-white placeholder:text-white/30 resize-none"
+                      placeholder="Prompt for analysis..."
+                    />
+                    <Button
+                      type="button"
+                      size="xs"
+                      variant="default"
+                      className="w-full bg-cyan-600 text-white hover:bg-cyan-500"
+                      disabled={isAnalyzing || isQuerying}
+                      onClick={() => void handleAnalyzeHeatmap()}
+                    >
+                      {isAnalyzing ? 'Analyzing...' : 'Analyze View'}
+                    </Button>
+                  </div>
                 </div>
               )}
 
-              {showAttentionMeta && (
-                <div className="grid gap-2 xl:grid-cols-2">
-                  <div>
-                    <p className="mb-1 text-[11px] text-muted-foreground">Sequence Window ({promptTokens.length})</p>
-                    <div className="h-12 overflow-y-auto rounded border border-white/10 bg-black/40 p-2">
-                      <div className="flex flex-wrap gap-1.5">
-                        {promptTokens.length === 0 ? (
-                          <p className="text-xs text-muted-foreground">No sequence tokens yet.</p>
+              {/* Main visualization area */}
+              <div className="flex min-h-0 flex-1 flex-col">
+                {/* Token strips (collapsible) */}
+                {showAttentionMeta && (
+                  <div className="grid shrink-0 gap-2 border-b border-white/10 bg-black/20 p-3 xl:grid-cols-2">
+                    <div>
+                      <p className="mb-1 text-[10px] font-medium uppercase tracking-widest text-muted-foreground">
+                        Sequence ({promptTokens.length})
+                      </p>
+                      <div className="max-h-16 overflow-y-auto rounded border border-white/10 bg-black/40 p-1.5">
+                        <div className="flex flex-wrap gap-1">
+                          {promptTokens.length === 0 ? (
+                            <p className="text-[11px] text-muted-foreground">Waiting...</p>
+                          ) : (
+                            promptTokens.map((token, idx) => (
+                              <span
+                                key={`${token}-${idx}`}
+                                className="rounded border border-cyan-400/20 bg-cyan-500/10 px-1 py-px font-mono text-[10px] text-cyan-200"
+                              >
+                                {token}
+                              </span>
+                            ))
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                    <div>
+                      <p className="mb-1 text-[10px] font-medium uppercase tracking-widest text-muted-foreground">
+                        Generated ({generatedTokens.length})
+                      </p>
+                      <div className="max-h-16 overflow-y-auto rounded border border-white/10 bg-black/40 p-1.5">
+                        {generatedTokens.length === 0 ? (
+                          <p className="text-[11px] text-muted-foreground">Waiting...</p>
                         ) : (
-                          promptTokens.map((token, idx) => (
-                            <span
-                              key={`${token}-${idx}`}
-                              className="rounded border border-cyan-400/25 bg-cyan-500/10 px-1.5 py-0.5 font-mono text-[11px]"
-                            >
-                              {token}
-                            </span>
-                          ))
+                          <div className="flex flex-wrap gap-1">
+                            {generatedTokens.map((token, idx) => (
+                              <span
+                                key={`gen-${idx}`}
+                                className="rounded border border-purple-400/20 bg-purple-500/10 px-1 py-px font-mono text-[10px] text-purple-200"
+                              >
+                                {token}
+                              </span>
+                            ))}
+                          </div>
                         )}
                       </div>
                     </div>
                   </div>
-                  <div>
-                    <p className="mb-1 text-[11px] text-muted-foreground">Generated Tokens ({generatedTokens.length})</p>
-                    <div className="h-12 overflow-y-auto rounded border border-white/10 bg-black/40 p-2">
-                      {generatedTokens.length === 0 ? (
-                        <p className="text-xs text-muted-foreground">No generated tokens yet.</p>
-                      ) : (
-                        <p className="font-mono text-xs leading-relaxed text-white/85">{generatedTokens.join('')}</p>
-                      )}
-                    </div>
+                )}
+
+                {/* Heatmap canvas */}
+                {totalLayers <= 0 || totalHeads <= 0 ? (
+                  <div className="flex flex-1 items-center justify-center">
+                    <p className="text-sm text-muted-foreground">Waiting for head-weight data...</p>
                   </div>
-                </div>
-              )}
+                ) : (
+                  <div data-slot="attention-viz" className="min-h-0 flex-1">
+                    {attentionViewMode === 'single' ? (
+                      <SingleHeadView
+                        heatmap={heatmapsRef.current[activeLayerIndex]?.[activeHeadIndex] ?? null}
+                        layerIndex={activeLayerIndex}
+                        headIndex={activeHeadIndex}
+                        scaleMax={attentionScaleMax}
+                        version={heatmapVersion}
+                        tokens={promptTokens}
+                      />
+                    ) : attentionViewMode === 'layer' ? (
+                      <LayerOverview
+                        layerHeatmaps={heatmapsRef.current[activeLayerIndex]}
+                        heads={totalHeads}
+                        scaleMax={attentionScaleMax}
+                        version={heatmapVersion}
+                        selectedHeadIndex={activeHeadIndex}
+                        onPickHead={(headIndex) => {
+                          setSelectedHeadIndex(headIndex);
+                          setAttentionViewMode('single');
+                        }}
+                        tokens={promptTokens}
+                      />
+                    ) : (
+                      <AttentionOverview
+                        heatmaps={heatmapsRef.current}
+                        layers={totalLayers}
+                        heads={totalHeads}
+                        seqLen={Math.max(seqLen, seqLenRef.current)}
+                        scaleMax={attentionScaleMax}
+                        version={heatmapVersion}
+                        selectedLayerIndex={activeLayerIndex}
+                        onPick={(layerIndex) => {
+                          setSelectedLayerIndex(layerIndex);
+                          setSelectedHeadIndex(0);
+                          setAttentionViewMode('layer');
+                        }}
+                      />
+                    )}
+                  </div>
+                )}
 
-              <div className="flex items-center gap-2 text-[10px] text-muted-foreground">
-                <span>0.0</span>
-                <div className="h-2 w-48 rounded-full bg-linear-to-r from-black to-cyan-400" />
-                <span>1.0</span>
+                {/* Analysis result */}
+                {analysisResult !== null && (
+                  <div className="shrink-0 border-t border-white/10 bg-black/30 p-3">
+                    <div className="flex items-center justify-between mb-2">
+                      <p className="text-[10px] font-medium uppercase tracking-widest text-muted-foreground">Analysis</p>
+                      <Button
+                        type="button"
+                        size="icon-xs"
+                        variant="ghost"
+                        className="text-white/60 hover:text-white"
+                        onClick={() => setAnalysisResult(null)}
+                      >
+                        ✕
+                      </Button>
+                    </div>
+                    <ScrollArea style={{ height: '120px' }}>
+                      <div className="prose prose-invert prose-xs max-w-none pr-2 text-xs leading-relaxed text-white/85 [&_h1]:text-sm [&_h2]:text-xs [&_h3]:text-xs [&_h1]:font-semibold [&_h2]:font-semibold [&_h3]:font-medium [&_p]:text-xs [&_li]:text-xs [&_ul]:pl-4 [&_ol]:pl-4 [&_code]:text-[10px] [&_code]:bg-white/10 [&_code]:px-1 [&_code]:rounded">
+                        <Markdown>{analysisResult}</Markdown>
+                      </div>
+                    </ScrollArea>
+                  </div>
+                )}
               </div>
-
-              {totalLayers <= 0 || totalHeads <= 0 ? (
-                <p className="text-xs text-muted-foreground">Waiting for head-weight data...</p>
-              ) : (
-                <div className="min-h-0 flex-1 overflow-hidden rounded border border-white/10 bg-black/55">
-                  {attentionViewMode === 'single' ? (
-                    <SingleHeadView
-                      heatmap={heatmapsRef.current[activeLayerIndex]?.[activeHeadIndex] ?? null}
-                      layerIndex={activeLayerIndex}
-                      headIndex={activeHeadIndex}
-                      version={heatmapVersion}
-                    />
-                  ) : attentionViewMode === 'layer' ? (
-                    <LayerOverview
-                      layerHeatmaps={heatmapsRef.current[activeLayerIndex]}
-                      heads={totalHeads}
-                      version={heatmapVersion}
-                      selectedHeadIndex={activeHeadIndex}
-                      onPickHead={(headIndex) => {
-                        setSelectedHeadIndex(headIndex);
-                        setAttentionViewMode('single');
-                      }}
-                    />
-                  ) : (
-                    <AttentionOverview
-                      heatmaps={heatmapsRef.current}
-                      layers={totalLayers}
-                      heads={totalHeads}
-                      seqLen={Math.max(seqLen, seqLenRef.current)}
-                      version={heatmapVersion}
-                      selectedLayerIndex={activeLayerIndex}
-                      onPick={(layerIndex) => {
-                        setSelectedLayerIndex(layerIndex);
-                        setSelectedHeadIndex(0);
-                        setAttentionViewMode('layer');
-                      }}
-                    />
-                  )}
-                </div>
-              )}
-            </CardContent>
-          </Card>
+            </div>
+          </div>
         </div>
       )}
 
-      {/* LAYER 4: AI Answer Panel */}
-      {aiAnswer !== null && (
-        <Card className="pointer-events-auto absolute top-20 left-6 z-20 flex max-h-[calc(100vh-160px)] w-90 flex-col overflow-hidden border-white/10 bg-black/70 backdrop-blur-xl">
-          <CardHeader className="relative pb-0">
-            <CardTitle className="text-xs font-medium uppercase tracking-widest text-muted-foreground">
-              AI Answer
-            </CardTitle>
-            <Button
-              variant="ghost"
-              size="icon-xs"
-              className="absolute top-3 right-3 text-white/70 hover:text-white"
-              onClick={() => {
-                setAiAnswer(null);
-                setAiSources([]);
-                setAiSourceNodes([]);
-                setActiveNodes([]);
-              }}
-            >
-              ✕
-            </Button>
-          </CardHeader>
-          <div className="min-h-0 flex-1 overflow-y-auto">
-            <CardContent className="pb-4">
-              <p className="text-sm leading-relaxed text-white/90">{aiAnswer}</p>
-
-              {aiSources.length > 0 && (
-                <>
-                  <Separator className="my-3 bg-white/10" />
-                  <h4 className="mb-2 text-xs font-medium uppercase tracking-widest text-muted-foreground">
-                    Sources ({aiSources.length})
-                  </h4>
-                  <div className="flex flex-col gap-2">
-                    {aiSources.map((src, i) => {
-                      const matchedNode = nodes.find((n) => n.text === src.text);
-                      return (
-                        <div
-                          key={i}
-                          onClick={() => {
-                            if (matchedNode) {
-                              const clusterIds = new Set<string>([matchedNode.id]);
-                              for (const edge of edges) {
-                                if (edge.sourceId === matchedNode.id) clusterIds.add(edge.targetId);
-                                if (edge.targetId === matchedNode.id) clusterIds.add(edge.sourceId);
-                              }
-                              const { activeNodeIds } = useAppStore.getState();
-                              const mergedIds = new Set<string>([...activeNodeIds, ...clusterIds]);
-                              setActiveNodes([...mergedIds]);
-                              setSelectedNode(matchedNode.id);
-                            }
-                          }}
-                          className={`rounded-lg p-2.5 text-xs transition-colors ${
-                            matchedNode
-                              ? 'cursor-pointer bg-white/5 border border-purple-500/30 hover:bg-white/10'
-                              : 'bg-white/5 border border-transparent'
-                          }`}
-                        >
-                          <div className="mb-1 flex items-center gap-1.5 text-muted-foreground">
-                            {matchedNode && (
-                              <div
-                                className="size-1.5 shrink-0 rounded-full"
-                                style={{ background: matchedNode.color }}
-                              />
-                            )}
-                            <span>{src.metadata.source}</span>
-                            {matchedNode && (
-                              <span className="opacity-70">— {matchedNode.label}</span>
-                            )}
-                          </div>
-                          <p className="leading-relaxed text-white/80">
-                            {src.text.length > 200 ? src.text.slice(0, 200) + '...' : src.text}
-                          </p>
-                        </div>
-                      );
-                    })}
-                  </div>
-                </>
-              )}
-            </CardContent>
-          </div>
-        </Card>
-      )}
-
-      {/* LAYER 5: Node Detail Side Panel */}
+      {/* LAYER 4: Node Detail Side Panel */}
       {(() => {
-        const selectedNode = selectedNodeId ? nodes.find((n) => n.id === selectedNodeId) : null;
-        const isOpen = selectedNode !== null && selectedNode !== undefined;
+        const isOpen = selectedNode !== null;
         const neighbors = isOpen
           ? edges
               .filter((e) => e.sourceId === selectedNodeId || e.targetId === selectedNodeId)
