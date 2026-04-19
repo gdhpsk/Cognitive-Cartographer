@@ -45,7 +45,12 @@ class ModelWanted(BaseModel):
 model_list = ["mistralai/Mistral-7B-Instruct-v0.3"]
 # Loading mistral ai for the local model
 model_id_local = model_list[0]
-device = "mps" if torch.backends.mps.is_available() else "cpu"
+device = (
+    "cuda" if torch.cuda.is_available() 
+    else "mps" if torch.backends.mps.is_available() 
+    else "xpu" if hasattr(torch, "xpu") and torch.xpu.is_available() 
+    else "cpu"
+)
 tokenizer = AutoTokenizer.from_pretrained(model_id_local)
 local_model = AutoModelForCausalLM.from_pretrained(
     model_id_local,
@@ -362,7 +367,7 @@ def get_graph():
     }
 
 
-MAX_SEQ_LEN = 100  # how detailed the attention windo is
+MAX_SEQ_LEN = 50  # how detailed the attention windo is
 MAX_NEW_TOKENS = 10
 
 
