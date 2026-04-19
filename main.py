@@ -321,7 +321,10 @@ async def websocket_upload(websocket: WebSocket):
                 websocket,
                 {"event": "error", "data": f"PDF exceeds max size ({MAX_PDF_SIZE_MB} MB)."},
             )
-            await websocket.close(code=1009)
+            try:
+                await websocket.close(code=1009)
+            except RuntimeError:
+                pass
             return
         if not await _safe_send_json(websocket, {"event": "status", "data": "PDF received"}):
             return
@@ -410,7 +413,7 @@ async def websocket_upload(websocket: WebSocket):
             except (WebSocketDisconnect, RuntimeError):
                 break
 
-    except WebSocketDisconnect:
+    except (WebSocketDisconnect, RuntimeError):
         pass
     finally:
         if session_id in sessions:
@@ -470,8 +473,11 @@ async def websocket_attention(websocket: WebSocket):
     await websocket.accept()
 
     try:
-        while True:
-            data = await websocket.receive_json()
+        while _websocket_connected(websocket):
+            try:
+                data = await websocket.receive_json()
+            except (WebSocketDisconnect, RuntimeError):
+                break
             session_id = data.get("session_id")
 
             if not session_id or session_id not in sessions:
