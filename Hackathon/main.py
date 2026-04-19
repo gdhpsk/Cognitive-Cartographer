@@ -28,10 +28,14 @@ class SearchRequest(BaseModel):  # base model for searching
     k: int
 
 
-load_dotenv(Path(__file__).parent / ".env")  # loading my .env file information
+class ModelWanted(BaseModel):
+    model_name: str
 
-# Loading mistral ai for the model
-model_id_local = "mistralai/Mistral-7B-Instruct-v0.3"
+
+load_dotenv(Path(__file__).parent / ".env")  # loading my .env file information
+model_list = ["mistralai/Mistral-7B-Instruct-v0.3"]
+# Loading mistral ai for the local model
+model_id_local = model_list[0]
 device = "mps" if torch.backends.mps.is_available() else "cpu"
 tokenizer = AutoTokenizer.from_pretrained(model_id_local)
 local_model = AutoModelForCausalLM.from_pretrained(
@@ -40,7 +44,31 @@ local_model = AutoModelForCausalLM.from_pretrained(
     attn_implementation="eager",
 ).to(device)
 
+
 app = FastAPI()
+
+
+@app.get("/aval_model")
+async def func_available_models():
+    return {"available_models": model_list}
+
+
+@app.patch("/choose_llm")
+async def choose_llm(model: ModelWanted):
+    """Endpoint to switch the LLM being used."""
+    global model_id_local
+    model_id_local = model.model_name
+    global device
+    device = "mps" if torch.backends.mps.is_available() else "cpu"
+    global tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(model_id_local)
+    global local_model
+    local_model = AutoModelForCausalLM.from_pretrained(
+        model_id_local,
+        torch_dtype=torch.float16 if device == "mps" else torch.float32,
+        attn_implementation="eager",
+    ).to(device)
+    return {"status": "ok"}
 
 
 # this route just to make sure it actually works
