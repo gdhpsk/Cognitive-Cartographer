@@ -60,6 +60,7 @@ Hackathon/
   requirements.txt  # Python dependencies
   .env              # API keys and config (not committed)
   chunks.json       # Sample chunk output (for reference)
+  config.json       # Allowed local models and default model
 ```
 
 ## Getting Started
@@ -94,6 +95,21 @@ MAX_SEQ_LEN=50
 | `ALLOW_CUSTOM_HF_MODELS` | No | If `true`, `PATCH /choose_llm` accepts any HF model ID. If `false`, only models in `/aval_model` are allowed. Defaults to `false`. |
 | `MAX_PDF_SIZE_MB` | No | Maximum PDF upload size in MB for `/ws/upload`. Set to `0` to disable the limit. Defaults to `0`. |
 | `MAX_SEQ_LEN` | No | Maximum prompt sequence length used for attention streaming. Defaults to `50`. |
+
+### Model Configuration
+
+Create a `config.json` file in the same directory as `main.py`:
+
+```json
+{
+  "available_models": [
+    "mistralai/Mistral-7B-Instruct-v0.3"
+  ],
+  "default_model": "mistralai/Mistral-7B-Instruct-v0.3"
+}
+```
+
+`available_models` controls the list returned by `/aval_model`, and `default_model` selects the model loaded on startup. If the file is missing or invalid, the server falls back to the default list.
 
 ### Install and Run
 

@@ -42,6 +42,35 @@ def _parse_int(value: str | None, default: int) -> int:
     except (ValueError, AttributeError):
         return default
 
+DEFAULT_MODEL_LIST = ["mistralai/Mistral-7B-Instruct-v0.3"]
+MODEL_CONFIG_PATH = Path(__file__).parent / "config.json"
+
+def _load_model_config(path: Path, fallback_models: list[str]) -> tuple[list[str], str]:
+    if not path.exists():
+        return fallback_models, fallback_models[0]
+    try:
+        data = json.loads(path.read_text())
+    except Exception:
+        return fallback_models, fallback_models[0]
+    if not isinstance(data, dict):
+        return fallback_models, fallback_models[0]
+
+    models = data.get("available_models")
+    if isinstance(models, list):
+        cleaned = [m.strip() for m in models if isinstance(m, str) and m.strip()]
+        models = cleaned
+    else:
+        models = []
+
+    if not models:
+        models = fallback_models
+
+    default_model = data.get("default_model")
+    if not isinstance(default_model, str) or default_model not in models:
+        default_model = models[0]
+
+    return models, default_model
+
 MAX_CONCURRENT_AI_REQUESTS = int(os.getenv("MAX_CONCURRENT_AI_REQUESTS", "1"))
 ALLOW_CUSTOM_HF_MODELS = _parse_bool(os.getenv("ALLOW_CUSTOM_HF_MODELS"), default=False)
 MAX_SEQ_LEN = max(1, _parse_int(os.getenv("MAX_SEQ_LEN"), default=50))
@@ -62,8 +91,7 @@ def encode_image(file):
     return base64.b64encode(file.read()).decode("utf-8")
 
 
-model_list = ["mistralai/Mistral-7B-Instruct-v0.3"]
-model_id_local = model_list[0]
+model_list, model_id_local = _load_model_config(MODEL_CONFIG_PATH, DEFAULT_MODEL_LIST)
 device = (
     "cuda" if torch.cuda.is_available()
     else "mps" if torch.backends.mps.is_available()
