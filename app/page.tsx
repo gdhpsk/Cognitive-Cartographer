@@ -16,12 +16,14 @@ import { Textarea } from '@/components/ui/textarea';
 import { SpotlightCard } from '@/components/ui/spotlight-card';
 import { TextGenerateEffect } from '@/components/ui/text-generate';
 import { GlowingBorder } from '@/components/ui/glowing-border';
+import { fetchModelPolicy, chooseLlmModel } from '@/lib/llm-api';
 
 const MIN_SCREEN_WIDTH = 1200;
-const CUSTOM_MODEL_OPTION = '__custom__';
-const ALLOW_CUSTOM_MODEL = ['1', 'true', 'yes', 'on'].includes(
-  String(process.env.NEXT_PUBLIC_ALLOW_CUSTOM ?? '').toLowerCase()
-);
+const DEFAULT_MAX_PDF_SIZE_MB = 0;
+
+function formatMegabytes(value: number): string {
+  return Number.isInteger(value) ? String(value) : value.toFixed(1);
+}
 
 interface QuerySource {
   text: string;
@@ -1101,13 +1103,18 @@ export default function App() {
   const [availableModels, setAvailableModels] = useState<string[]>([]);
   const [selectedModelOption, setSelectedModelOption] = useState('');
   const [customModelName, setCustomModelName] = useState('');
+  const [allowCustomHfModels, setAllowCustomHfModels] = useState(false);
+  const [isCustomModelInputEnabled, setIsCustomModelInputEnabled] = useState(false);
   const [activeModelName, setActiveModelName] = useState('');
   const [modelStatus, setModelStatus] = useState('');
   const [isLoadingModels, setIsLoadingModels] = useState(false);
   const [isSwitchingModel, setIsSwitchingModel] = useState(false);
+  const [maxPdfSizeMb, setMaxPdfSizeMb] = useState<number>(DEFAULT_MAX_PDF_SIZE_MB);
+  const [maxSeqLen, setMaxSeqLen] = useState<number>(0);
   const [aiAnswer, setAiAnswer] = useState<string | null>(null);
   const [aiSources, setAiSources] = useState<QuerySource[]>([]);
   const [isQuerying, setIsQuerying] = useState(false);
+  const [queuePosition, setQueuePosition] = useState<number | null>(null);
   const [attentionStatus, setAttentionStatus] = useState('Idle');
   const [promptTokens, setPromptTokens] = useState<string[]>([]);
   const [generatedTokens, setGeneratedTokens] = useState<string[]>([]);
@@ -1116,8 +1123,10 @@ export default function App() {
   const [totalHeads, setTotalHeads] = useState(0);
   const [heatmapVersion, setHeatmapVersion] = useState(0);
   const [uploadStatus, setUploadStatus] = useState<string>('');
+  const [uploadErrorMessage, setUploadErrorMessage] = useState<string | null>(null);
   const [isUploading, setIsUploading] = useState(false);
   const [hasUploadedPdf, setHasUploadedPdf] = useState(false);
+  const [sessionLost, setSessionLost] = useState(false);
   const [pendingUploadFile, setPendingUploadFile] = useState<File | null>(null);
   const [isScreenWideEnough, setIsScreenWideEnough] = useState(true);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
@@ -1138,7 +1147,7 @@ export default function App() {
     originX: 0,
     originY: 0,
   });
-  const { nodes, edges, isLoading, setLoading, setActiveNodes, setAiSourceNodes, selectedNodeId, setSelectedNode, loadGraph } = useAppStore();
+  const { nodes, edges, isLoading, setLoading, setActiveNodes, setAiSourceNodes, selectedNodeId, setSelectedNode, loadGraph, sessionId, setSessionId, setUploadSocket } = useAppStore();
 
   const pinSourceNodes = useCallback((sources: QuerySource[]) => {
     const { nodes: currentNodes, edges: currentEdges } = useAppStore.getState();
@@ -1301,7 +1310,7 @@ export default function App() {
     if (!aiQuery.trim() || isQuerying) return;
 
     if (!apiHost) {
-      setAiAnswer('Missing NEXT_PUBLIC_HOSTNAME.');
+      setAiAnswer('API host is not configured. Set it in the setup screen.');
       return;
     }
 
@@ -1311,6 +1320,7 @@ export default function App() {
     }
 
     setIsQuerying(true);
+    setQueuePosition(null);
     setIsAttentionPopoverOpen(true);
     setAttentionStatus('Connecting to /ws/attention...');
     setAiAnswer(null);
@@ -1323,7 +1333,7 @@ export default function App() {
 
     ws.onopen = () => {
       setAttentionStatus('Connected. Streaming attention heads...');
-      ws.send(JSON.stringify({ query: aiQuery.trim(), k: aiK }));
+      ws.send(JSON.stringify({ query: aiQuery.trim(), k: aiK, max_tokens: maxTokens, session_id: useAppStore.getState().sessionId }));
     };
 
     ws.onmessage = (event) => {
@@ -1381,7 +1391,15 @@ export default function App() {
           return;
         }
 
+        if (eventName === 'queued' && isRecord(data)) {
+          const pos = typeof data.position === 'number' ? data.position : null;
+          setQueuePosition(pos);
+          setAttentionStatus(typeof data.message === 'string' ? data.message : 'Queued — waiting for model...');
+          return;
+        }
+
         if (eventName === 'tokens' && isRecord(data)) {
+          setQueuePosition(null);
           const incomingTokens = Array.isArray(data.prompt_tokens)
             ? data.prompt_tokens.map((token) => String(token))
             : Array.isArray(data.tokens)
@@ -1532,6 +1550,17 @@ export default function App() {
           return;
         }
 
+        if (eventName === 'error') {
+          const errorMsg = typeof data === 'string' ? data : (isRecord(data) && typeof data.message === 'string' ? data.message : 'An error occurred.');
+          setQueuePosition(null);
+          setAiAnswer(errorMsg);
+          setAttentionStatus('Error from server.');
+          completed = true;
+          setIsQuerying(false);
+          ws.close();
+          return;
+        }
+
         if (eventName === 'attention_done' && isRecord(data)) {
           const layers = toPositiveInt(
             data.total_layers,
@@ -1568,6 +1597,7 @@ export default function App() {
     };
 
     ws.onerror = () => {
+      setQueuePosition(null);
       setAiAnswer('Failed to connect to attention service.');
       setAttentionStatus('WebSocket error while streaming attention.');
       setIsQuerying(false);
@@ -1578,6 +1608,7 @@ export default function App() {
     ws.onclose = () => {
       if (wsRef.current === ws) wsRef.current = null;
       if (!completed) {
+        setQueuePosition(null);
         setIsQuerying(false);
         setIsAttentionPopoverOpen(false);
       }
@@ -1600,37 +1631,43 @@ export default function App() {
 
   const fetchAvailableModels = useCallback(async () => {
     if (!apiHost) {
-      setModelStatus('Missing NEXT_PUBLIC_HOSTNAME.');
+      setModelStatus('API host is not configured. Set it in the setup screen.');
       return;
     }
 
     setIsLoadingModels(true);
     try {
-      const response = await fetch(`${API_BASE}/aval_model`, { cache: 'no-store' });
-      const payload = await response.json();
-      const incomingModels =
-        isRecord(payload) && Array.isArray(payload.available_models)
-          ? payload.available_models
-              .filter((model): model is string => typeof model === 'string')
-              .map((model) => model.trim())
-              .filter((model) => model.length > 0)
-          : [];
+      const {
+        availableModels: modelsFromPolicy,
+        allowCustomHfModels: allowCustom,
+        maxPdfSizeMb: serverMaxPdfSizeMb,
+        maxSeqLen: serverMaxSeqLen,
+      } = await fetchModelPolicy(API_BASE);
 
-      const uniqueModels = [...new Set(incomingModels)];
-      setAvailableModels(uniqueModels);
+      setAvailableModels(modelsFromPolicy);
+      setAllowCustomHfModels(allowCustom);
+      setMaxPdfSizeMb(serverMaxPdfSizeMb);
+      setMaxSeqLen(serverMaxSeqLen);
+      setIsCustomModelInputEnabled((prev) => (allowCustom ? prev : false));
       setSelectedModelOption((prev) => {
-        if (ALLOW_CUSTOM_MODEL && prev === CUSTOM_MODEL_OPTION) return prev;
-        if (prev && uniqueModels.includes(prev)) return prev;
-        return uniqueModels[0] ?? '';
+        if (prev && modelsFromPolicy.includes(prev)) return prev;
+        return modelsFromPolicy[0] ?? '';
       });
 
-      if (uniqueModels.length === 0) {
+      if (modelsFromPolicy.length === 0) {
         setModelStatus('No models returned by /aval_model.');
       } else {
-        setModelStatus(`Loaded ${uniqueModels.length} models.`);
+        setModelStatus(
+          allowCustom
+            ? `Loaded ${modelsFromPolicy.length} models.`
+            : `Loaded ${modelsFromPolicy.length} models. Custom HF models are disabled by the server.`
+        );
       }
     } catch (error) {
       console.error('Failed to fetch available models:', error);
+      setAllowCustomHfModels(false);
+      setMaxSeqLen(0);
+      setIsCustomModelInputEnabled(false);
       setModelStatus('Failed to load models.');
     } finally {
       setIsLoadingModels(false);
@@ -1638,44 +1675,37 @@ export default function App() {
   }, [API_BASE]);
 
   const handleChooseModel = useCallback(async () => {
-    const isCustomOptionSelected = selectedModelOption === CUSTOM_MODEL_OPTION;
+    const trimmedCustomModelName = customModelName.trim();
+    const trimmedSelectedModel = selectedModelOption.trim();
     const modelName =
-      ALLOW_CUSTOM_MODEL && isCustomOptionSelected
-        ? customModelName.trim()
-        : isCustomOptionSelected
-          ? ''
-          : selectedModelOption.trim();
+      allowCustomHfModels && isCustomModelInputEnabled && trimmedCustomModelName.length > 0
+        ? trimmedCustomModelName
+        : trimmedSelectedModel;
 
     if (!modelName) {
-      setModelStatus(ALLOW_CUSTOM_MODEL
-        ? 'Select a model or enter a custom model name.'
-        : 'Select a model.'
-      );
+      setModelStatus('Select a model from the dropdown or enter a custom HF model ID.');
       return;
     }
     if (!apiHost) {
-      setModelStatus('Missing NEXT_PUBLIC_HOSTNAME.');
+      setModelStatus('API host is not configured. Set it in the setup screen.');
       return;
     }
 
     setIsSwitchingModel(true);
     try {
-      const response = await fetch(`${API_BASE}/choose_llm`, {
-        method: 'PATCH',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          model_name: modelName,
-        }),
-      });
+      const result = await chooseLlmModel(API_BASE, modelName);
 
-      const payload = await response.json();
-      const status = isRecord(payload) && typeof payload.status === 'string' ? payload.status : '';
-      const detail = isRecord(payload) && typeof payload.detail === 'string' ? payload.detail : '';
+      if (!result.ok) {
+        if (result.statusCode === 403) {
+          setModelStatus(
+            result.detail ||
+              'This model is blocked by server policy. Choose one of the available models or ask the server admin to enable custom HF models.'
+          );
+          void fetchAvailableModels();
+          return;
+        }
 
-      if (!response.ok || (status !== '' && status !== 'ok')) {
-        setModelStatus(detail ? `Failed to switch model: ${detail}` : 'Failed to switch model.');
+        setModelStatus(result.detail ? `Failed to switch model: ${result.detail}` : 'Failed to switch model.');
         return;
       }
 
@@ -1687,12 +1717,14 @@ export default function App() {
     } finally {
       setIsSwitchingModel(false);
     }
-  }, [API_BASE, customModelName, selectedModelOption]);
+  }, [API_BASE, allowCustomHfModels, customModelName, fetchAvailableModels, isCustomModelInputEnabled, selectedModelOption]);
 
   const handleLoadGraph = useCallback(async () => {
+    const currentSessionId = useAppStore.getState().sessionId;
+    if (!currentSessionId) return;
     setLoading(true);
     try {
-      const res = await fetch(`${API_BASE}/graph`);
+      const res = await fetch(`${API_BASE}/graph?session_id=${encodeURIComponent(currentSessionId)}`);
       const data: GraphData = await res.json();
       const graphNodes = data.nodes.map((n) => ({
         id: n.id,
@@ -1714,22 +1746,59 @@ export default function App() {
   }, [API_BASE, loadGraph, setLoading]);
 
   const handleUploadFileSelection = useCallback((files: File[]) => {
+    if (isUploading) return;
+
     const file = files?.[0];
-    if (!file || isUploading) return;
+    if (!file) {
+      setPendingUploadFile(null);
+      return;
+    }
+
+    if (maxPdfSizeMb > 0 && file.size > maxPdfSizeMb * 1024 * 1024) {
+      const message = `This PDF is too large (${(file.size / (1024 * 1024)).toFixed(2)} MB). Maximum allowed size is ${formatMegabytes(maxPdfSizeMb)} MB.`;
+      setHasUploadedPdf(false);
+      setPendingUploadFile(null);
+      setUploadErrorMessage(message);
+      setUploadStatus(message);
+      return;
+    }
+
+    setUploadErrorMessage(null);
     setHasUploadedPdf(false);
     setPendingUploadFile(file);
     setUploadStatus(`Ready to upload: ${file.name}`);
-  }, [isUploading]);
+  }, [isUploading, maxPdfSizeMb]);
 
   const handleConfirmUpload = useCallback(() => {
     if (!pendingUploadFile || isUploading) return;
+
+    if (maxPdfSizeMb > 0 && pendingUploadFile.size > maxPdfSizeMb * 1024 * 1024) {
+      const message = `This PDF is too large (${(pendingUploadFile.size / (1024 * 1024)).toFixed(2)} MB). Maximum allowed size is ${formatMegabytes(maxPdfSizeMb)} MB.`;
+      setPendingUploadFile(null);
+      setUploadErrorMessage(message);
+      setUploadStatus(message);
+      return;
+    }
+
+    // Close any existing session socket — backend will clean up the old document.
+    const existingSocket = useAppStore.getState().uploadSocket;
+    if (existingSocket) {
+      existingSocket.onclose = null;
+      existingSocket.close();
+      setUploadSocket(null);
+    }
+    setSessionId(null);
+    setSessionLost(false);
     setHasUploadedPdf(false);
+    setUploadErrorMessage(null);
     setIsUploading(true);
     setUploadStatus('Connecting to upload service...');
 
     const uploadWs = new WebSocket(`${WS_BASE}/ws/upload`);
+    let sessionSaved = false;
 
     uploadWs.onopen = () => {
+      setUploadErrorMessage(null);
       setUploadStatus('Connected. Uploading PDF bytes...');
       uploadWs.send(pendingUploadFile);
     };
@@ -1739,11 +1808,15 @@ export default function App() {
         const parsed = JSON.parse(msg.data);
         if (typeof parsed?.data === 'string') setUploadStatus(parsed.data);
         if (parsed?.event === 'done') {
+          const sid = typeof parsed.session_id === 'string' ? parsed.session_id : null;
+          sessionSaved = true;
+          setSessionId(sid);
+          setUploadSocket(uploadWs);
           setHasUploadedPdf(true);
           setPendingUploadFile(null);
           setIsUploading(false);
           void handleLoadGraph();
-          uploadWs.close();
+          // Do NOT close the socket — keeping it open preserves the server-side session.
         }
       } catch {
         if (typeof msg.data === 'string') setUploadStatus(msg.data);
@@ -1751,15 +1824,24 @@ export default function App() {
     };
 
     uploadWs.onerror = () => {
-      setUploadStatus('Upload failed. Check that the server is running.');
+      const message = 'Upload failed. Check that the server is running.';
+      setUploadErrorMessage(message);
+      setUploadStatus(message);
       setHasUploadedPdf(false);
       setIsUploading(false);
     };
 
     uploadWs.onclose = () => {
       setIsUploading(false);
+      if (sessionSaved) {
+        // Unexpected close after the session was established — session is now gone.
+        setSessionId(null);
+        setUploadSocket(null);
+        setHasUploadedPdf(false);
+        setSessionLost(true);
+      }
     };
-  }, [handleLoadGraph, isUploading, pendingUploadFile]);
+  }, [handleLoadGraph, isUploading, maxPdfSizeMb, pendingUploadFile, setSessionId, setUploadSocket]);
 
   useEffect(() => {
     const checkViewportWidth = () => {
@@ -1776,7 +1858,22 @@ export default function App() {
         wsRef.current.close();
         wsRef.current = null;
       }
+      const sock = useAppStore.getState().uploadSocket;
+      if (sock) {
+        sock.onclose = null;
+        sock.close();
+        useAppStore.getState().setUploadSocket(null);
+      }
     };
+  }, []);
+
+  useEffect(() => {
+    const handleBeforeUnload = () => {
+      const sock = useAppStore.getState().uploadSocket;
+      if (sock) sock.close();
+    };
+    window.addEventListener('beforeunload', handleBeforeUnload);
+    return () => window.removeEventListener('beforeunload', handleBeforeUnload);
   }, []);
 
   useEffect(() => {
@@ -1796,13 +1893,11 @@ export default function App() {
   const activeLayerIndex = Math.max(0, Math.min(selectedLayerIndex, maxLayerIndex));
   const activeHeadIndex = Math.max(0, Math.min(selectedHeadIndex, maxHeadIndex));
   const selectedNode = selectedNodeId ? nodes.find((n) => n.id === selectedNodeId) ?? null : null;
-  const isCustomOptionSelected = selectedModelOption === CUSTOM_MODEL_OPTION;
+  const trimmedCustomModelName = customModelName.trim();
   const pendingModelName =
-    ALLOW_CUSTOM_MODEL && isCustomOptionSelected
-      ? customModelName.trim()
-      : isCustomOptionSelected
-        ? ''
-        : selectedModelOption.trim();
+    allowCustomHfModels && isCustomModelInputEnabled && trimmedCustomModelName.length > 0
+      ? trimmedCustomModelName
+      : selectedModelOption.trim();
   const attentionScaleMax = useGlobalScale ? 1 : undefined;
 
   const handleQueryCardDragStart = (event: React.PointerEvent<HTMLDivElement>) => {
@@ -1865,7 +1960,7 @@ export default function App() {
                     API Host
                   </label>
                   <Input
-                    placeholder="e.g. graph.example.com"
+                    placeholder="e.g. api.example.com"
                     value={apiHostInput}
                     onChange={(e) => setApiHostInput(e.target.value)}
                     className="bg-black/50 border-white/10 text-white placeholder:text-white/30"
@@ -1909,6 +2004,31 @@ export default function App() {
         <Scene />
       </div>
 
+      {/* No-session overlay on graph */}
+      {!sessionId && (
+        <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center">
+          <p className="rounded-lg bg-black/50 px-4 py-2 text-sm text-white/40 backdrop-blur-sm">
+            Upload a document to explore the knowledge graph.
+          </p>
+        </div>
+      )}
+
+      {/* Session-lost banner */}
+      {sessionLost && (
+        <div className="pointer-events-auto absolute left-1/2 top-4 z-50 -translate-x-1/2">
+          <div className="flex items-center gap-3 rounded-lg border border-red-500/40 bg-red-950/80 px-4 py-2.5 text-sm text-red-200 shadow-lg backdrop-blur-md">
+            <span>Session expired — please re-upload your document.</span>
+            <button
+              type="button"
+              className="shrink-0 text-red-300 hover:text-white transition-colors"
+              onClick={() => setSessionLost(false)}
+            >
+              ✕
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* LAYER 2: HTML UI Overlay */}
       <div className="pointer-events-none absolute inset-0 z-30 p-6">
         <div className="relative h-full w-full">
@@ -1944,7 +2064,22 @@ export default function App() {
 
           {/* Bottom-left Upload / AI Answer */}
           <div className="pointer-events-auto absolute bottom-0 left-0 w-[min(360px,100%)]">
-            {aiAnswer !== null ? (
+            {queuePosition !== null ? (
+              <Card className="bg-black/60 backdrop-blur-xl border-white/10">
+                <CardContent className="p-3">
+                  <div className="flex items-center gap-3">
+                    <span className="relative flex size-2.5 shrink-0">
+                      <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-cyan-400 opacity-75" />
+                      <span className="relative inline-flex size-2.5 rounded-full bg-cyan-500" />
+                    </span>
+                    <p className="text-sm text-white/70">
+                      Position <span className="font-semibold text-cyan-400">#{queuePosition}</span> in queue — waiting for the model...
+                    </p>
+                  </div>
+                  <p className="mt-1.5 text-[11px] text-muted-foreground">The graph has loaded. You can explore it while waiting.</p>
+                </CardContent>
+              </Card>
+            ) : aiAnswer !== null ? (
               <Card className="flex h-[min(400px,calc(100vh-200px))] flex-col overflow-hidden bg-black/60 backdrop-blur-xl border-white/10">
                 <CardHeader className="shrink-0 pb-0">
                   <div className="flex items-center justify-between">
@@ -2028,9 +2163,24 @@ export default function App() {
             ) : (
               <Card className="bg-black/60 backdrop-blur-xl border-white/10">
                 <CardContent className="p-3">
-                  <FileUpload className="p-4" onChange={handleUploadFileSelection} />
-                  <p className="mt-2 min-h-4.5 px-1 text-xs text-muted-foreground">
-                    {isUploading ? `Uploading: ${uploadStatus}` : uploadStatus}
+                  <FileUpload
+                    className="p-4"
+                    onChange={handleUploadFileSelection}
+                    maxPdfSizeMb={maxPdfSizeMb}
+                    onValidationError={(message) => {
+                      setUploadErrorMessage(message);
+                      if (message) {
+                        setHasUploadedPdf(false);
+                        setPendingUploadFile(null);
+                        setUploadStatus(message);
+                      }
+                    }}
+                  />
+                  <p className={`mt-2 min-h-4.5 px-1 text-xs ${uploadErrorMessage ? 'text-red-400' : 'text-muted-foreground'}`}>
+                    {uploadErrorMessage || (isUploading ? `Uploading: ${uploadStatus}` : uploadStatus)}
+                  </p>
+                  <p className="px-1 text-[11px] text-muted-foreground">
+                    Server max PDF size: {maxPdfSizeMb > 0 ? `${formatMegabytes(maxPdfSizeMb)} MB` : 'No limit'}
                   </p>
                   <Button
                     className="mt-2 w-full"
@@ -2051,9 +2201,10 @@ export default function App() {
               <Card className="bg-black/60 backdrop-blur-xl border-white/10">
                 <CardContent className="p-3">
                   <Button
-                    variant={isLoading || isUploading || !hasUploadedPdf ? 'secondary' : 'default'}
-                    disabled={isLoading || isUploading || !hasUploadedPdf}
+                    variant={isLoading || isUploading || !sessionId ? 'secondary' : 'default'}
+                    disabled={isLoading || isUploading || !sessionId}
                     onClick={handleLoadGraph}
+                    title={!sessionId ? 'Upload a document first' : undefined}
                     className="bg-cyan-500 text-black hover:bg-cyan-400 disabled:bg-secondary disabled:text-muted-foreground"
                   >
                     {isLoading ? 'Loading...' : 'Load Graph'}
@@ -2133,10 +2284,11 @@ export default function App() {
                 >
                   <div className="flex flex-col gap-2">
                     <Input
-                      placeholder="Ask a question..."
+                      placeholder={sessionId ? 'Ask a question...' : 'Upload a document first'}
                       value={aiQuery}
+                      disabled={!sessionId}
                       onChange={(e) => setAiQuery(e.target.value)}
-                      className="w-72 bg-black/50 border-white/10 text-white placeholder:text-white/40"
+                      className="w-72 bg-black/50 border-white/10 text-white placeholder:text-white/40 disabled:opacity-50"
                     />
 
                     <div className="flex items-center gap-2">
@@ -2155,9 +2307,6 @@ export default function App() {
                               {modelName}
                             </SelectItem>
                           ))}
-                          {ALLOW_CUSTOM_MODEL && (
-                            <SelectItem value={CUSTOM_MODEL_OPTION}>Custom model...</SelectItem>
-                          )}
                         </SelectContent>
                       </Select>
 
@@ -2172,13 +2321,35 @@ export default function App() {
                       </Button>
                     </div>
 
-                    {ALLOW_CUSTOM_MODEL && selectedModelOption === CUSTOM_MODEL_OPTION && (
-                      <Input
-                        placeholder="Enter custom model name..."
-                        value={customModelName}
-                        onChange={(e) => setCustomModelName(e.target.value)}
-                        className="w-72 bg-black/50 border-white/10 text-white placeholder:text-white/40"
-                      />
+                    {allowCustomHfModels ? (
+                      <>
+                        <div className="flex items-center justify-between rounded border border-white/10 bg-black/40 px-2 py-1">
+                          <span className="text-[11px] text-muted-foreground">Use custom HF model ID</span>
+                          <Switch
+                            size="sm"
+                            checked={isCustomModelInputEnabled}
+                            disabled={isLoadingModels || isSwitchingModel}
+                            onCheckedChange={(checked) => setIsCustomModelInputEnabled(Boolean(checked))}
+                            aria-label="Toggle custom HF model input"
+                          />
+                        </div>
+                        <Input
+                          placeholder="e.g. meta-llama/Llama-3.1-8B-Instruct"
+                          value={customModelName}
+                          disabled={!isCustomModelInputEnabled || isSwitchingModel}
+                          onChange={(e) => setCustomModelName(e.target.value)}
+                          className="w-72 bg-black/50 border-white/10 text-white placeholder:text-white/40 disabled:opacity-55"
+                        />
+                        <span className="text-[11px] text-muted-foreground">
+                          {isCustomModelInputEnabled
+                            ? 'When non-empty, this custom ID overrides the dropdown model.'
+                            : 'Using the selected dropdown model.'}
+                        </span>
+                      </>
+                    ) : (
+                      <span className="text-[11px] text-muted-foreground">
+                        Custom HF models are disabled by the server. Choose one of the available models.
+                      </span>
                     )}
 
                     <div className="flex items-center gap-2">
@@ -2194,9 +2365,9 @@ export default function App() {
                       <span className="max-w-52 truncate text-xs text-muted-foreground">
                         {modelStatus || (activeModelName
                           ? `Using model: ${activeModelName}`
-                          : ALLOW_CUSTOM_MODEL
+                          : availableModels.length > 0
                             ? 'No model selected'
-                            : 'No model selected (custom disabled)')}
+                            : 'No models loaded')}
                       </span>
                     </div>
 
@@ -2214,10 +2385,18 @@ export default function App() {
                         }}
                       />
                     </div>
+
+                    <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                      <span>Max prompt length:</span>
+                      <span className="font-mono text-cyan-200/85">
+                        {maxSeqLen > 0 ? `${maxSeqLen} tokens` : 'Server default'}
+                      </span>
+                    </div>
                   </div>
                   <Button
                     type="submit"
-                    disabled={isQuerying || isSwitchingModel || !aiQuery.trim()}
+                    disabled={isQuerying || isSwitchingModel || !aiQuery.trim() || !sessionId}
+                    title={!sessionId ? 'Upload a document first' : undefined}
                     className="self-start bg-purple-500 text-white hover:bg-purple-400 disabled:bg-secondary disabled:text-muted-foreground"
                   >
                     {isQuerying ? 'Thinking...' : 'Ask AI'}
@@ -2391,9 +2570,25 @@ export default function App() {
                 {showAttentionMeta && (
                   <div className="grid shrink-0 gap-2 border-b border-white/10 bg-black/20 p-3 xl:grid-cols-2">
                     <div>
-                      <p className="mb-1 text-[10px] font-medium uppercase tracking-widest text-muted-foreground">
-                        Sequence ({promptTokens.length})
-                      </p>
+                      <div className="mb-1 flex items-center gap-1">
+                        <p className="text-[10px] font-medium uppercase tracking-widest text-muted-foreground">
+                          Sequence ({promptTokens.length})
+                        </p>
+                        <span className="group relative inline-flex">
+                          <span
+                            aria-hidden="true"
+                            className="flex size-3.5 cursor-help items-center justify-center rounded-full border border-white/20 text-[9px] font-semibold text-white/70"
+                          >
+                            ?
+                          </span>
+                          <span
+                            role="tooltip"
+                            className="pointer-events-none absolute left-0 top-full z-20 mt-1 w-56 rounded border border-white/15 bg-black/90 px-2 py-1 text-[10px] normal-case tracking-normal text-white/80 opacity-0 transition-opacity duration-150 group-hover:opacity-100"
+                          >
+                            Sequence tokens are the tokenized input context the model is currently attending over.
+                          </span>
+                        </span>
+                      </div>
                       <div className="max-h-16 overflow-y-auto rounded border border-white/10 bg-black/40 p-1.5">
                         <div className="flex flex-wrap gap-1">
                           {promptTokens.length === 0 ? (
@@ -2412,9 +2607,25 @@ export default function App() {
                       </div>
                     </div>
                     <div>
-                      <p className="mb-1 text-[10px] font-medium uppercase tracking-widest text-muted-foreground">
-                        Generated ({generatedTokens.length})
-                      </p>
+                      <div className="mb-1 flex items-center gap-1">
+                        <p className="text-[10px] font-medium uppercase tracking-widest text-muted-foreground">
+                          Generated ({generatedTokens.length})
+                        </p>
+                        <span className="group relative inline-flex">
+                          <span
+                            aria-hidden="true"
+                            className="flex size-3.5 cursor-help items-center justify-center rounded-full border border-white/20 text-[9px] font-semibold text-white/70"
+                          >
+                            ?
+                          </span>
+                          <span
+                            role="tooltip"
+                            className="pointer-events-none absolute left-0 top-full z-20 mt-1 w-56 rounded border border-white/15 bg-black/90 px-2 py-1 text-[10px] normal-case tracking-normal text-white/80 opacity-0 transition-opacity duration-150 group-hover:opacity-100"
+                          >
+                            Generated tokens are the new output tokens produced step by step by the model.
+                          </span>
+                        </span>
+                      </div>
                       <div className="max-h-16 overflow-y-auto rounded border border-white/10 bg-black/40 p-1.5">
                         {generatedTokens.length === 0 ? (
                           <p className="text-[11px] text-muted-foreground">Waiting...</p>

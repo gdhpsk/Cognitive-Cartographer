@@ -44,6 +44,8 @@ interface AppState {
   activeNodeIds: Set<string>;
   aiSourceNodeIds: Set<string>;
   selectedNodeId: string | null;
+  sessionId: string | null;
+  uploadSocket: WebSocket | null;
   addNode: (label: string, position: [number, number, number], text?: string) => string;
   addEdge: (sourceId: string, targetId: string) => void;
   setLoading: (status: boolean) => void;
@@ -51,6 +53,8 @@ interface AppState {
   setAiSourceNodes: (ids: string[]) => void;
   setSelectedNode: (id: string | null) => void;
   loadGraph: (nodes: NodeData[], edges: EdgeData[]) => void;
+  setSessionId: (id: string | null) => void;
+  setUploadSocket: (ws: WebSocket | null) => void;
 }
 
 
@@ -61,6 +65,8 @@ export const useAppStore = create<AppState>((set) => ({
   isLoading: false,
   activeNodeIds: new Set<string>(),
   aiSourceNodeIds: new Set<string>(),
+  sessionId: null,
+  uploadSocket: null,
 
   addNode: (label, position, text = '') => {
     const id = Math.random().toString();
@@ -87,5 +93,7 @@ export const useAppStore = create<AppState>((set) => ({
   }),
   setSelectedNode: (id) => set({ selectedNodeId: id }),
   loadGraph: (nodes, edges) => set({ nodes, edges, activeNodeIds: new Set(), aiSourceNodeIds: new Set(), selectedNodeId: null }),
-  setLoading: (status) => set({ isLoading: status })
+  setLoading: (status) => set({ isLoading: status }),
+  setSessionId: (id) => set({ sessionId: id }),
+  setUploadSocket: (ws) => set({ uploadSocket: ws }),
 }));

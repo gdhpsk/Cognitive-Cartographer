@@ -25,33 +25,51 @@ const secondaryVariant = {
   },
 };
 
-const MAX_PDF_SIZE_MB = 30;
-const MAX_PDF_SIZE_BYTES = MAX_PDF_SIZE_MB * 1024 * 1024;
-
 export const FileUpload = ({
   onChange,
+  onValidationError,
+  maxPdfSizeMb = 0,
   className,
 }: {
   onChange?: (files: File[]) => void;
+  onValidationError?: (message: string | null) => void;
+  maxPdfSizeMb?: number;
   className?: string;
 }) => {
   const [files, setFiles] = useState<File[]>([]);
   const [uploadError, setUploadError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const hasSizeLimit = maxPdfSizeMb > 0;
+  const maxPdfSizeBytes = hasSizeLimit ? maxPdfSizeMb * 1024 * 1024 : Infinity;
+  const maxPdfSizeLabel = Number.isInteger(maxPdfSizeMb) ? String(maxPdfSizeMb) : maxPdfSizeMb.toFixed(1);
+
+  const getTooLargeMessage = (file: File) =>
+    `This PDF is too large (${(file.size / (1024 * 1024)).toFixed(2)} MB). Max allowed size is ${maxPdfSizeLabel} MB.`;
 
   const handleFileChange = (newFiles: File[]) => {
-    const hasOversizedFile = newFiles.some((file) => file.size > MAX_PDF_SIZE_BYTES);
-    if (hasOversizedFile) {
-      setUploadError(`File too big. Max file size is ${MAX_PDF_SIZE_MB} MB.`);
+    const file = newFiles[0];
+
+    if (!file) {
+      setUploadError(null);
+      setFiles([]);
+      onValidationError?.(null);
+      onChange?.([]);
       return;
     }
 
-    const validFiles = newFiles.filter((file) => file.size <= MAX_PDF_SIZE_BYTES).slice(0, 1);
-    setUploadError(null);
-    setFiles(validFiles);
-    if (onChange && validFiles.length > 0) {
-      onChange(validFiles);
+    if (hasSizeLimit && file.size > maxPdfSizeBytes) {
+      const message = getTooLargeMessage(file);
+      setUploadError(message);
+      setFiles([]);
+      onValidationError?.(message);
+      onChange?.([]);
+      return;
     }
+
+    setUploadError(null);
+    setFiles([file]);
+    onValidationError?.(null);
+    onChange?.([file]);
   };
 
   const handleClick = () => {
@@ -61,10 +79,23 @@ export const FileUpload = ({
   const { getRootProps, isDragActive } = useDropzone({
     multiple: false,
     noClick: true,
-    maxSize: MAX_PDF_SIZE_BYTES,
+    maxSize: maxPdfSizeBytes,
     onDrop: handleFileChange,
-    onDropRejected: () => {
-      setUploadError(`File too big. Max file size is ${MAX_PDF_SIZE_MB} MB.`);
+    onDropRejected: (rejections) => {
+      const firstRejection = rejections[0];
+      const firstErrorCode = firstRejection?.errors?.[0]?.code;
+
+      let message = 'Could not add this file. Please upload a valid PDF.';
+      if (firstErrorCode === 'file-too-large' && hasSizeLimit && firstRejection?.file) {
+        message = getTooLargeMessage(firstRejection.file);
+      } else if (firstErrorCode === 'file-invalid-type') {
+        message = 'Please upload a PDF file.';
+      }
+
+      setUploadError(message);
+      setFiles([]);
+      onValidationError?.(message);
+      onChange?.([]);
     },
   });
 
@@ -93,6 +124,9 @@ export const FileUpload = ({
           <p className="relative z-20 font-sans font-normal text-neutral-400 dark:text-neutral-400 text-base mt-2">
             Drag or drop your files here or click to upload
           </p>
+          <p className="relative z-20 font-sans text-xs text-neutral-500 dark:text-neutral-500 mt-1">
+            Max PDF size: {hasSizeLimit ? `${maxPdfSizeLabel} MB` : 'No limit'}
+          </p>
           {uploadError && (
             <p className="relative z-20 mt-2 text-sm font-medium text-red-600 dark:text-red-400">
               {uploadError}
@@ -107,7 +141,7 @@ export const FileUpload = ({
                   className={cn(
                     "relative overflow-hidden z-40 bg-white dark:bg-neutral-900 flex flex-col items-start justify-start md:h-24 p-4 mt-4 w-full mx-auto rounded-md",
                     "shadow-sm",
-                    (file.size / (1024 * 1024)) > MAX_PDF_SIZE_MB ? `border-red-600 border-2` : ""
+                    hasSizeLimit && (file.size / (1024 * 1024)) > maxPdfSizeMb ? `border-red-600 border-2` : ""
                   )}
                 >
                   <div className="flex justify-between w-full items-center gap-4">

@@ -15,7 +15,9 @@ A 3D knowledge graph visualizer with real-time attention head visualization, AI-
 - Ask natural language questions against the uploaded document via WebSocket (`/ws/attention`)
 - Responses include source citations linked to graph nodes — click a source to fly to the relevant node
 - Model selection with live switching via `/choose_llm` and `/aval_model` API endpoints
-- Configurable retrieval parameter `k` (number of context chunks)
+- Configurable retrieval parameter `k` (number of context chunks) and max tokens
+- Queue-aware: when the server is at its inference concurrency limit, a queue-position banner with an animated pulse is shown so users know to wait — the graph is still fully explorable in the meantime
+- Session-based: each upload creates a persistent server-side session tied to the upload WebSocket lifetime
 
 ### Attention Head Visualization
 - Real-time streaming of transformer attention weights during inference
@@ -82,22 +84,17 @@ types/
   - `GET /aval_model` — returns `{ available_models: string[] }`
   - `PATCH /choose_llm` — switches the active LLM
   - `POST /image_analysis` — accepts `image` (file) + `prompt` (form field), returns `{ analysis: string }`
-  - `WSS /ws/upload` — accepts PDF bytes, streams progress, returns `done`
-  - `WSS /ws/attention` — accepts `{ query, k }`, streams `tokens`, `attention`/`gen_step`, `answer`/`attention_done` events
+  - `WSS /ws/upload` — accepts PDF bytes, streams progress events, returns `done` with `session_id`. **Keep this socket open** — closing it destroys the server-side session.
+  - `GET /graph?session_id=<uuid>` — returns `{ nodes, edges }` for the active session
+  - `WSS /ws/attention` — accepts `{ query, k, max_tokens, session_id }`, streams `graph` → (optional `queued`) → `tokens` → `attention`/`gen_step` → `answer`/`attention_done`
 
 ### Connecting to the Backend
 
-On first launch, the app displays a setup screen prompting for your backend API hostname (e.g. `graph.example.com`). Enter the hostname only — HTTPS and WSS protocols are applied automatically. The value is saved to `localStorage` so you only need to enter it once. You can change it anytime via the "change" link in the header card.
+On first launch, the app displays a setup screen prompting for your backend API hostname (e.g. `api.example.com`). Enter the hostname only — HTTPS and WSS protocols are applied automatically. The value is saved to `localStorage` so you only need to enter it once. You can change it anytime via the "change" link in the header card.
 
-### Environment Variables (optional)
+### Environment Variables
 
-```env
-NEXT_PUBLIC_ALLOW_CUSTOM=off
-```
-
-| Variable | Description |
-|----------|-------------|
-| `NEXT_PUBLIC_ALLOW_CUSTOM` | Set to `on` to allow entering custom model names in the model selector. |
+No frontend environment variables are required.
 
 ### Install and Run
 
@@ -119,18 +116,22 @@ Open [http://localhost:3000](http://localhost:3000). Minimum screen width: 1200p
 
 ### `/ws/attention`
 
-**Send:** `{ "query": "...", "k": 10 }`
+**Send:** `{ "query": "...", "k": 10, "max_tokens": 200, "session_id": "<uuid>" }`
+
+The `session_id` is required and obtained from the `/ws/upload` `done` event. The session lives as long as the upload WebSocket remains connected.
 
 **Receive (event stream):**
 
-| Event | Description |
-|-------|-------------|
-| `tokens` | `{ prompt_tokens, seq_len, total_layers, total_heads }` — initializes the attention grid |
-| `attention` | Full attention matrices for all layers/heads at a given step |
-| `gen_step` | Incremental attention row per generation step with `{ step, token, layers: [{ layer, head_weights }] }` |
-| `graph` | `{ nodes, edges, path }` — the knowledge graph with highlighted source path |
-| `answer` | `{ answer, sources }` — the final AI response with source citations |
-| `attention_done` | Signals completion of attention streaming |
+| Event | Payload | Description |
+|-------|---------|-------------|
+| `graph` | `{ nodes, edges, path }` | Knowledge graph with highlighted source path — always sent first |
+| `queued` | `{ position, message }` | Server concurrency limit reached; request is queued at `position`. The UI shows a queue-position banner. Omitted on fast-path. |
+| `tokens` | `{ prompt_tokens, seq_len, total_layers, total_heads }` | Inference started (clears queued state); initializes the attention grid |
+| `attention` | `{ step, token, attention_grid, … }` | Full attention matrices for all layers/heads at a given step |
+| `gen_step` | `{ step, token, layers: [{ layer, head_weights }] }` | Incremental attention row per generation step |
+| `answer` | `{ answer, sources }` | Final AI response with source citations |
+| `attention_done` | `{ total_layers, total_heads }` | Signals completion of attention streaming |
+| `error` | `string \| { message }` | Terminal error (e.g. invalid/expired session). Input is re-enabled. |
 
 ## License
 
