@@ -4,13 +4,12 @@ import tempfile
 from dotenv import load_dotenv
 from pydantic import BaseModel
 import fitz
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Form
+from openai import OpenAI
 from fastapi.middleware.cors import CORSMiddleware
 from pathlib import Path
 import nltk
 from nltk.tokenize import sent_tokenize
-
-nltk.download("punkt_tab", quiet=True)
 import json
 from langchain_openai import OpenAIEmbeddings
 from qdrant_client import QdrantClient
@@ -21,6 +20,13 @@ from sklearn.decomposition import PCA
 import numpy as np
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
+import base64
+
+nltk.download("punkt_tab", quiet=True)
+
+load_dotenv(Path(__file__).parent / ".env")
+
+os.environ["OPENAI_API_KEY"] = f"{os.getenv('OPENAI_API_KEY')}"
 
 
 class SearchRequest(BaseModel):  # base model for searching
@@ -28,11 +34,14 @@ class SearchRequest(BaseModel):  # base model for searching
     k: int
 
 
+def encode_image(file):
+    return base64.b64encode(file.read()).decode("utf-8")
+
+
 class ModelWanted(BaseModel):
     model_name: str
 
 
-load_dotenv(Path(__file__).parent / ".env")  # loading my .env file information
 model_list = ["mistralai/Mistral-7B-Instruct-v0.3"]
 # Loading mistral ai for the local model
 model_id_local = model_list[0]
@@ -51,6 +60,41 @@ app = FastAPI()
 @app.get("/aval_model")
 async def func_available_models():
     return {"available_models": model_list}
+
+
+openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+
+@app.post("/image_analysis")
+async def image_analysis(
+    image: UploadFile = File(...),
+    prompt: str = Form("What is in this image? Describe it in detail."),
+):
+    """Accept an image from the frontend, send it to GPT-4o, return the response."""
+    image_bytes = await image.read()
+    b64_image = base64.b64encode(image_bytes).decode("utf-8")
+    mime_type = image.content_type or "image/png"
+
+    response = openai_client.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:{mime_type};base64,{b64_image}"
+                        },
+                    },
+                ],
+            }
+        ],
+        max_tokens=1000,
+    )
+
+    return {"analysis": response.choices[0].message.content}
 
 
 @app.patch("/choose_llm")
