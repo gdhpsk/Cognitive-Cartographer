@@ -623,6 +623,7 @@ function AttentionOverview({
   const [zoom, setZoom] = useState(1);
   const [isDragging, setIsDragging] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
+  const [containerSize, setContainerSize] = useState({ width: 0, height: 0 });
   const dragStateRef = useRef({
     active: false,
     pointerId: -1,
@@ -636,6 +637,28 @@ function AttentionOverview({
   const safeLayers = Math.max(1, layers);
   const safeHeads = Math.max(1, heads);
   const safeSeqLen = Math.max(1, seqLen);
+
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+
+    const updateSize = () => {
+      const rect = el.getBoundingClientRect();
+      setContainerSize({
+        width: Math.max(1, Math.round(rect.width)),
+        height: Math.max(1, Math.round(rect.height)),
+      });
+    };
+
+    updateSize();
+
+    const observer = new ResizeObserver(() => {
+      updateSize();
+    });
+    observer.observe(el);
+
+    return () => observer.disconnect();
+  }, []);
 
   useEffect(() => {
     for (let layerIndex = 0; layerIndex < safeLayers; layerIndex++) {
@@ -705,9 +728,26 @@ function AttentionOverview({
     dragStateRef.current.moved = false;
   }, [safeLayers, safeHeads]);
 
-  const depthStep = safeLayers > 1 ? Math.max(24, Math.min(124, Math.floor(1450 / safeLayers))) : 0;
-  const yStep = safeLayers > 1 ? Math.max(9, Math.min(34, Math.floor(560 / safeLayers))) : 0;
-  const stageScale = Math.max(0.22, Math.min(0.9, 1.08 - safeLayers * 0.026));
+  const minViewportDim = Math.max(1, Math.min(containerSize.width || 1, containerSize.height || 1));
+  const viewportScale = Math.max(0.75, Math.min(1.6, minViewportDim / 900));
+  const perspectivePx = Math.round(Math.max(1300, Math.min(3200, minViewportDim * 2.1)));
+
+  const baseDepthStep = safeLayers > 1 ? Math.max(24, Math.min(124, Math.floor(1450 / safeLayers))) : 0;
+  const baseYStep = safeLayers > 1 ? Math.max(9, Math.min(34, Math.floor(560 / safeLayers))) : 0;
+  const depthStep = safeLayers > 1
+    ? Math.round(baseDepthStep * (0.9 + (viewportScale - 1) * 0.35))
+    : 0;
+  const yStep = safeLayers > 1
+    ? Math.round(baseYStep * (0.92 + (viewportScale - 1) * 0.22))
+    : 0;
+
+  const baseStageScale = Math.max(0.22, Math.min(0.9, 1.08 - safeLayers * 0.026));
+  const stageScale = Math.max(0.22, Math.min(1.08, baseStageScale * (0.95 + (viewportScale - 1) * 0.25)));
+
+  const stageWidthPx = Math.round(Math.max(920, Math.min((containerSize.width || 1200) * 1.22, 2500)));
+  const stageHeightPx = Math.round(Math.max(640, Math.min((containerSize.height || 800) * 1.16, 1800)));
+  const tiltX = Math.max(49, Math.min(58, 57 - (viewportScale - 1) * 4));
+  const tiltZ = Math.max(-12, Math.min(-7, -10 + (viewportScale - 1) * 2.5));
 
   const handlePointerDown = (event: React.PointerEvent<HTMLDivElement>) => {
     dragStateRef.current = {
@@ -760,7 +800,7 @@ function AttentionOverview({
       <div
         ref={containerRef}
         className={`absolute inset-0 flex items-center justify-center ${isDragging ? 'cursor-grabbing' : 'cursor-grab'}`}
-        style={{ perspective: '1500px' }}
+        style={{ perspective: `${perspectivePx}px` }}
         onPointerDown={handlePointerDown}
         onPointerMove={handlePointerMove}
         onPointerUp={handlePointerUp}
@@ -768,10 +808,13 @@ function AttentionOverview({
         onDoubleClick={() => { setPan({ x: 0, y: 0 }); setZoom(1); }}
       >
         <div
-          className="relative h-[128%] w-[132%]"
+          className="relative"
           style={{
+            width: `${stageWidthPx}px`,
+            height: `${stageHeightPx}px`,
             transformStyle: 'preserve-3d',
-            transform: `translate(${pan.x}px, ${pan.y}px) scale(${stageScale * zoom}) rotateX(57deg) rotateZ(-10deg)`,
+            transform: `translate(${pan.x}px, ${pan.y}px) scale(${stageScale * zoom}) rotateX(${tiltX}deg) rotateZ(${tiltZ}deg)`,
+            willChange: 'transform',
           }}
         >
           {Array.from({ length: safeLayers }).map((_, layerIndex) => (

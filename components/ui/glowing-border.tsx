@@ -19,7 +19,7 @@ export function GlowingBorder({
       style={{ borderRadius }}
     >
       <div
-        className="absolute inset-0 animate-spin-slow"
+        className="absolute inset-0"
         style={{
           borderRadius,
           background: `conic-gradient(from 0deg, transparent, ${glowColor}, transparent, transparent)`,
