@@ -317,20 +317,25 @@ async def websocket_upload(websocket: WebSocket):
     try:
         pdf_bytes = await websocket.receive_bytes()
         if MAX_PDF_SIZE_BYTES is not None and len(pdf_bytes) > MAX_PDF_SIZE_BYTES:
-            await websocket.send_json({
-                "event": "error",
-                "data": f"PDF exceeds max size ({MAX_PDF_SIZE_MB} MB).",
-            })
+            await _safe_send_json(
+                websocket,
+                {"event": "error", "data": f"PDF exceeds max size ({MAX_PDF_SIZE_MB} MB)."},
+            )
             await websocket.close(code=1009)
             return
-        await websocket.send_json({"event": "status", "data": "PDF received"})
+        if not await _safe_send_json(websocket, {"event": "status", "data": "PDF received"}):
+            return
 
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
             tmp.write(pdf_bytes)
             tmp_path = tmp.name
 
         try:
-            await websocket.send_json({"event": "status", "data": "Extracting text from PDF..."})
+            if not await _safe_send_json(
+                websocket,
+                {"event": "status", "data": "Extracting text from PDF..."},
+            ):
+                return
             doc = fitz.open(tmp_path)
             text = ""
             for page in doc:
@@ -338,17 +343,33 @@ async def websocket_upload(websocket: WebSocket):
                 text += "\n--- PAGE BREAK ---\n"
             page_count = doc.page_count
             doc.close()
-            await websocket.send_json({"event": "status", "data": f"Extracted text from {page_count} pages"})
+            if not await _safe_send_json(
+                websocket,
+                {"event": "status", "data": f"Extracted text from {page_count} pages"},
+            ):
+                return
 
-            await websocket.send_json({"event": "status", "data": "Splitting text into chunks..."})
+            if not await _safe_send_json(
+                websocket,
+                {"event": "status", "data": "Splitting text into chunks..."},
+            ):
+                return
             chunks = sent_tokenize(text)
             chunks_data = [
                 {"chat_id": i, "text": chunk, "length": len(chunk)}
                 for i, chunk in enumerate(chunks)
             ]
-            await websocket.send_json({"event": "status", "data": f"Created {len(chunks_data)} chunks"})
+            if not await _safe_send_json(
+                websocket,
+                {"event": "status", "data": f"Created {len(chunks_data)} chunks"},
+            ):
+                return
 
-            await websocket.send_json({"event": "status", "data": "Embedding chunks..."})
+            if not await _safe_send_json(
+                websocket,
+                {"event": "status", "data": "Embedding chunks..."},
+            ):
+                return
             texts = [item["text"] for item in chunks_data]
             metadatas = [
                 {"chat_id": item["chat_id"], "length": item["length"], "source": "uploaded.pdf"}
@@ -373,14 +394,21 @@ async def websocket_upload(websocket: WebSocket):
                 "vectorstore": session_vectorstore,
             }
 
-            await websocket.send_json({"event": "done", "data": "Upload complete", "session_id": session_id})
+            if not await _safe_send_json(
+                websocket,
+                {"event": "done", "data": "Upload complete", "session_id": session_id},
+            ):
+                return
 
         finally:
             os.unlink(tmp_path)
 
         # Hold the connection open — session lives as long as this WS is connected
-        while True:
-            await websocket.receive()
+        while _websocket_connected(websocket):
+            try:
+                await websocket.receive()
+            except (WebSocketDisconnect, RuntimeError):
+                break
 
     except WebSocketDisconnect:
         pass
