@@ -1838,6 +1838,8 @@ export default function App() {
         setSessionId(null);
         setUploadSocket(null);
         setHasUploadedPdf(false);
+        setPendingUploadFile(pendingUploadFile);
+        setUploadStatus(`Session closed. Ready to re-upload: ${pendingUploadFile.name}`);
         setAiAnswer(null);
         setAiSources([]);
         setSessionLost(true);
