@@ -1601,8 +1601,6 @@ export default function App() {
       setAiAnswer('Failed to connect to attention service.');
       setAttentionStatus('WebSocket error while streaming attention.');
       setIsQuerying(false);
-      setIsAttentionPopoverOpen(false);
-      resetAttentionState();
     };
 
     ws.onclose = () => {
@@ -1610,7 +1608,6 @@ export default function App() {
       if (!completed) {
         setQueuePosition(null);
         setIsQuerying(false);
-        setIsAttentionPopoverOpen(false);
       }
     };
   }, [
