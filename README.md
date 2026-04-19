@@ -1,12 +1,19 @@
 # Cognitive Cartographer — Backend
 
-A FastAPI backend that processes PDFs into semantic knowledge graphs, streams real-time transformer attention weights during inference, and exposes vector-similarity Q&A powered by Mistral-7B and OpenAI embeddings.
+A FastAPI backend that processes PDFs into per-session semantic knowledge graphs, streams real-time transformer attention weights during inference, and exposes vector-similarity Q&A powered by Mistral-7B and OpenAI embeddings. Multiple users can upload documents simultaneously; each session is isolated and automatically cleaned up when the client disconnects.
 
 ## Features
 
+### Session-Based Multi-Document Support
+- Each PDF upload creates an isolated session with its own Qdrant collection, identified by a UUID `session_id`
+- The session lives exactly as long as the `/ws/upload` WebSocket connection — disconnecting automatically deletes all associated vectors and chunk data
+- Multiple users can have active sessions concurrently without interfering with each other
+- Re-uploading a file closes the old connection (and its session) and opens a fresh one
+
 ### PDF Ingestion Pipeline
-- Upload a PDF over WebSocket; the backend extracts text with **PyMuPDF**, sentence-tokenizes with **NLTK**, embeds each chunk with OpenAI **text-embedding-3-small** (1536D), and stores vectors in an in-memory **Qdrant** collection
+- Upload a PDF over WebSocket; the backend extracts text with **PyMuPDF**, sentence-tokenizes with **NLTK**, embeds each chunk with OpenAI **text-embedding-3-small** (1536D), and stores vectors in a per-session in-memory **Qdrant** collection
 - Progress is streamed as JSON status events so the frontend can display live upload feedback
+- The `done` event returns the `session_id` required for all subsequent API calls
 
 ### Knowledge Graph Construction
 - Embeddings are PCA-reduced to 3D positions (normalized to a unit sphere) for spatial layout
@@ -18,10 +25,11 @@ A FastAPI backend that processes PDFs into semantic knowledge graphs, streams re
 - After each token, all 32 layers × 32 heads of attention weights are extracted, windowed to the last 50 tokens, and pushed into an asyncio queue
 - Attention grids stream over WebSocket in real time — one event per generated token — before the final answer is sent
 
-### AI Q&A
+### AI Q&A with Request Queuing
 - Vector similarity search retrieves the top-k relevant chunks from Qdrant
 - Mistral-7B generates a raw answer conditioned on the retrieved context, then reformats it in a second non-streaming pass for clean output
 - The final answer event includes full source citations (text + metadata)
+- Concurrent inference is capped by `MAX_CONCURRENT_AI_REQUESTS`; requests beyond that limit are queued and notified of their position via a `queued` event
 
 ### GPT-4o Heatmap Analysis
 - `/image_analysis` accepts a PNG and an optional prompt, base64-encodes the image, and queries GPT-4o for a vision analysis response
@@ -37,7 +45,7 @@ A FastAPI backend that processes PDFs into semantic knowledge graphs, streams re
 | Local LLM | Mistral-7B-Instruct-v0.3 (Hugging Face Transformers) |
 | Embeddings | OpenAI text-embedding-3-small |
 | Vision | GPT-4o (OpenAI) |
-| Vector Database | Qdrant (in-memory) |
+| Vector Database | Qdrant (in-memory, per-session collections) |
 | PDF Parsing | PyMuPDF (fitz) |
 | Text Chunking | NLTK sentence tokenizer |
 | Graph Layout | scikit-learn PCA + cosine similarity |
@@ -50,9 +58,8 @@ A FastAPI backend that processes PDFs into semantic knowledge graphs, streams re
 Hackathon/
   main.py           # Complete FastAPI application — all endpoints and business logic
   requirements.txt  # Python dependencies
-  .env              # API keys (not committed)
+  .env              # API keys and config (not committed)
   chunks.json       # Sample chunk output (for reference)
-  output.txt        # Sample extracted text (for reference)
 ```
 
 ## Getting Started
@@ -73,12 +80,20 @@ Create a `.env` file in the `Hackathon/` directory:
 ```env
 OPENAI_API_KEY=sk-proj-...
 HF_TOKEN=hf_...
+MAX_CONCURRENT_AI_REQUESTS=1
+ALLOW_CUSTOM_HF_MODELS=false
+MAX_PDF_SIZE_MB=0
+MAX_SEQ_LEN=50
 ```
 
 | Variable | Description |
 |----------|-------------|
 | `OPENAI_API_KEY` | Required for chunk embeddings (`text-embedding-3-small`) and GPT-4o image analysis |
 | `HF_TOKEN` | Required to download Mistral-7B from Hugging Face Hub |
+| `MAX_CONCURRENT_AI_REQUESTS` | Max parallel LLM inference calls across all connected users. Excess requests queue automatically and the client receives a `queued` event with their position. Defaults to `1`. |
+| `ALLOW_CUSTOM_HF_MODELS` | If `true`, `PATCH /choose_llm` accepts any HF model ID. If `false`, only models in `/aval_model` are allowed. Defaults to `false`. |
+| `MAX_PDF_SIZE_MB` | Maximum PDF upload size in MB for `/ws/upload`. Set to `0` to disable the limit. Defaults to `0`. |
+| `MAX_SEQ_LEN` | Maximum prompt sequence length used for attention streaming. Defaults to `50`. |
 
 ### Install and Run
 
@@ -96,7 +111,7 @@ pip install -r requirements.txt
 python -c "import nltk; nltk.download('punkt'); nltk.download('punkt_tab')"
 
 # Start the server
-uvicorn main:app --reload --host 0.0.0.0 --port 8000
+uvicorn main:app --host 0.0.0.0 --port 8000 --ws websockets-sansio
 ```
 
 Mistral-7B-Instruct-v0.3 (~13 GB) will download from Hugging Face on first startup. Subsequent starts load from the local cache.
@@ -109,7 +124,13 @@ Mistral-7B-Instruct-v0.3 (~13 GB) will download from Hugging Face on first start
 ### REST Endpoints
 
 #### `GET /graph`
-Returns the full knowledge graph derived from the most recently uploaded PDF.
+Returns the full knowledge graph for a session.
+
+**Query parameters**
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `session_id` | string | Yes | UUID returned by the `/ws/upload` `done` event |
 
 **Response**
 ```json
@@ -130,16 +151,21 @@ Returns the full knowledge graph derived from the most recently uploaded PDF.
 }
 ```
 
-Edges connect any two chunks with cosine similarity ≥ 0.65.
+Edges connect any two chunks with cosine similarity ≥ 0.65. Returns `404` if the session has expired or the `session_id` is unknown.
 
 ---
 
 #### `GET /aval_model`
-Returns the list of available local LLM identifiers.
+Returns the list of available local LLM identifiers and server limits.
 
 **Response**
 ```json
-{ "available_models": ["mistralai/Mistral-7B-Instruct-v0.3"] }
+{
+  "available_models": ["mistralai/Mistral-7B-Instruct-v0.3"],
+  "allow_custom_hf_models": false,
+  "max_pdf_size_mb": 0,
+  "max_seq_len": 50
+}
 ```
 
 ---
@@ -194,7 +220,7 @@ Hot-swaps the active local model without restarting the server.
 ### WebSocket Endpoints
 
 #### `WS /ws/upload`
-Uploads and ingests a PDF document.
+Uploads and ingests a PDF document, and keeps the session alive.
 
 **Client → Server:** raw PDF bytes
 
@@ -207,10 +233,10 @@ Uploads and ingests a PDF document.
 { "event": "status", "data": "Splitting text into chunks..." }
 { "event": "status", "data": "Created 100 chunks" }
 { "event": "status", "data": "Embedding chunks..." }
-{ "event": "done",   "data": "Upload complete" }
+{ "event": "done",   "data": "Upload complete", "session_id": "uuid-string" }
 ```
 
-Uploading a new PDF deletes the previous Qdrant collection and replaces it.
+**Session lifecycle** — the connection stays open after the `done` event. The session (and all its vectors) exists only while this WebSocket remains connected. Closing it — whether explicitly, by re-uploading, or by navigating away — immediately deletes the session server-side. To upload a new document, close the existing connection and open a fresh one.
 
 ---
 
@@ -220,6 +246,7 @@ Runs Q&A with real-time attention weight streaming.
 **Client → Server**
 ```json
 {
+  "session_id": "uuid-string",
   "query": "What is the document about?",
   "k": 5,
   "max_tokens": 10
@@ -228,15 +255,24 @@ Runs Q&A with real-time attention weight streaming.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
+| `session_id` | string | — | UUID from the `/ws/upload` `done` event |
 | `query` | string | — | Natural language question |
-| `k` | integer | — | Number of chunks to retrieve |
+| `k` | integer | 5 | Number of chunks to retrieve |
 | `max_tokens` | integer | 10 | Maximum tokens to generate |
 
 **Server → Client:** sequence of typed events
 
 ---
 
-**`graph` event** — emitted first, before generation begins
+**`error` event** — returned immediately if the session is missing or expired
+
+```json
+{ "event": "error", "data": "Invalid or expired session. Upload a document first." }
+```
+
+---
+
+**`graph` event** — emitted immediately after retrieval, before waiting for the model
 
 ```json
 {
@@ -262,7 +298,20 @@ Runs Q&A with real-time attention weight streaming.
 
 ---
 
-**`tokens` event** — emitted after the prompt is tokenized
+**`queued` event** — emitted if the server is at its inference concurrency limit
+
+```json
+{
+  "event": "queued",
+  "data": { "position": 2, "message": "Server is busy. Your request is queued." }
+}
+```
+
+The graph event is always sent before any queuing occurs, so the graph updates instantly even when the model is busy. Once the request reaches the front of the queue, inference begins and the `tokens` event follows.
+
+---
+
+**`tokens` event** — emitted after the prompt is tokenized and inference begins
 
 ```json
 {
@@ -327,10 +376,16 @@ Runs Q&A with real-time attention weight streaming.
 
 ## Architecture Notes
 
+### Session Isolation
+Each `/ws/upload` connection gets a UUID and its own Qdrant collection named `session_<uuid>`. The shared `QdrantClient` instance hosts all active collections simultaneously. When the upload socket closes, the `finally` block deletes the collection and removes the session from the in-memory registry — no manual cleanup needed.
+
+### Request Queuing
+An `asyncio.Semaphore` initialized from `MAX_CONCURRENT_AI_REQUESTS` gates entry into the inference block. Requests that exceed the limit suspend at the semaphore and a `queued` event with the current queue depth is sent to the client. The semaphore is released in a `finally` block so it is always freed even if inference fails or the client disconnects mid-stream. Note that the graph retrieval step runs before the semaphore is acquired, so graph updates are always instant regardless of server load.
+
 ### Device Selection
 The backend auto-detects the best available device at startup:
 ```
-MPS (Apple Silicon) → CUDA → CPU
+CUDA → MPS (Apple Silicon) → XPU → CPU
 ```
 Mistral-7B loads in `float16` on MPS/CUDA and `float32` on CPU.
 
@@ -341,9 +396,9 @@ To bound memory and payload size, attention matrices are windowed to the last `M
 Token generation is CPU/GPU-bound and runs on a background executor thread. Results are returned to the async WebSocket handler via an `asyncio.Queue`, keeping the event loop unblocked throughout.
 
 ### State & Persistence
-- The Qdrant vector database is **in-memory** — all ingested data is lost on server restart.
-- `chunks_data` (the raw chunk list) and the loaded model are global server-side state shared across all connections.
-- There is no multi-document support; each PDF upload replaces the previous collection.
+- The Qdrant vector database is **in-memory** — all session data is lost on server restart
+- The loaded model and tokenizer are global and shared across all sessions
+- Each session's `chunks_data` and `vectorstore` are stored in the `sessions` dict and deleted on disconnect
 
 ## License
 
