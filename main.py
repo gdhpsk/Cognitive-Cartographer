@@ -8,6 +8,7 @@ import fitz
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Form, HTTPException
 from openai import OpenAI
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.websockets import WebSocketState
 from pathlib import Path
 import nltk
 from nltk.tokenize import sent_tokenize
@@ -91,6 +92,20 @@ def encode_image(file):
     return base64.b64encode(file.read()).decode("utf-8")
 
 
+def _websocket_connected(websocket: WebSocket) -> bool:
+    return websocket.client_state == WebSocketState.CONNECTED
+
+
+async def _safe_send_json(websocket: WebSocket, payload: dict) -> bool:
+    if not _websocket_connected(websocket):
+        return False
+    try:
+        await websocket.send_json(payload)
+        return True
+    except (WebSocketDisconnect, RuntimeError):
+        return False
+
+
 model_list, model_id_local = _load_model_config(MODEL_CONFIG_PATH, DEFAULT_MODEL_LIST)
 device = (
     "cuda" if torch.cuda.is_available()
@@ -98,10 +113,15 @@ device = (
     else "xpu" if hasattr(torch, "xpu") and torch.xpu.is_available()
     else "cpu"
 )
+def _select_torch_dtype(selected_device: str) -> torch.dtype:
+    if selected_device in {"cuda", "mps", "xpu"}:
+        return torch.float16
+    return torch.float32
+
 tokenizer = AutoTokenizer.from_pretrained(model_id_local)
 local_model = AutoModelForCausalLM.from_pretrained(
     model_id_local,
-    torch_dtype=torch.float16 if device == "mps" else torch.float32,
+    torch_dtype=_select_torch_dtype(device),
     attn_implementation="eager",
 ).to(device)
 
@@ -186,7 +206,7 @@ async def choose_llm(model: ModelWanted):
     tokenizer = AutoTokenizer.from_pretrained(model_id_local)
     local_model = AutoModelForCausalLM.from_pretrained(
         model_id_local,
-        torch_dtype=torch.float16 if device == "mps" else torch.float32,
+        torch_dtype=_select_torch_dtype(device),
         attn_implementation="eager",
     ).to(device)
     return {"status": "ok"}
@@ -427,7 +447,11 @@ async def websocket_attention(websocket: WebSocket):
             session_id = data.get("session_id")
 
             if not session_id or session_id not in sessions:
-                await websocket.send_json({"event": "error", "data": "Invalid or expired session. Upload a document first."})
+                if not await _safe_send_json(
+                    websocket,
+                    {"event": "error", "data": "Invalid or expired session. Upload a document first."},
+                ):
+                    return
                 continue
 
             session = sessions[session_id]
@@ -444,24 +468,32 @@ async def websocket_attention(websocket: WebSocket):
             nodes, edges, sim_matrix = build_graph(session_id, threshold=0.8, mark_sources=source_chat_ids)
             path = [f"chunk_{id}" for id in source_chat_ids]
 
-            await websocket.send_json({
-                "event": "graph",
-                "data": {
-                    "nodes": nodes,
-                    "edges": edges,
-                    "path": path,
-                    "sim_matrix": sim_matrix,
+            if not await _safe_send_json(
+                websocket,
+                {
+                    "event": "graph",
+                    "data": {
+                        "nodes": nodes,
+                        "edges": edges,
+                        "path": path,
+                        "sim_matrix": sim_matrix,
+                    },
                 },
-            })
+            ):
+                return
 
             # Notify the client if they have to wait for the model
             global _ai_queue_depth
             if _ai_semaphore.locked():
                 _ai_queue_depth += 1
-                await websocket.send_json({
-                    "event": "queued",
-                    "data": {"position": _ai_queue_depth, "message": "Server is busy. Your request is queued."},
-                })
+                if not await _safe_send_json(
+                    websocket,
+                    {
+                        "event": "queued",
+                        "data": {"position": _ai_queue_depth, "message": "Server is busy. Your request is queued."},
+                    },
+                ):
+                    return
 
             await _ai_semaphore.acquire()
 
@@ -481,14 +513,18 @@ async def websocket_attention(websocket: WebSocket):
                 num_heads = local_model.config.num_attention_heads
 
                 prompt_tokens = tokenizer.convert_ids_to_tokens(input_ids[0])
-                await websocket.send_json({
-                    "event": "tokens",
-                    "data": {
-                        "prompt_tokens": prompt_tokens,
-                        "num_layers": num_layers,
-                        "num_heads": num_heads,
+                if not await _safe_send_json(
+                    websocket,
+                    {
+                        "event": "tokens",
+                        "data": {
+                            "prompt_tokens": prompt_tokens,
+                            "num_layers": num_layers,
+                            "num_heads": num_heads,
+                        },
                     },
-                })
+                ):
+                    return
 
                 queue = asyncio.Queue()
                 loop = asyncio.get_event_loop()
@@ -501,18 +537,22 @@ async def websocket_attention(websocket: WebSocket):
                         break
 
                     full_answer.append(item["token"])
-                    await websocket.send_json({
-                        "event": "attention",
-                        "data": {
-                            "step": item["step"],
-                            "token": item["token"],
-                            "tokens": item["tokens"],
-                            "seq_len": item["seq_len"],
-                            "num_layers": num_layers,
-                            "num_heads": num_heads,
-                            "attention_grid": item["attention_grid"],
+                    if not await _safe_send_json(
+                        websocket,
+                        {
+                            "event": "attention",
+                            "data": {
+                                "step": item["step"],
+                                "token": item["token"],
+                                "tokens": item["tokens"],
+                                "seq_len": item["seq_len"],
+                                "num_layers": num_layers,
+                                "num_heads": num_heads,
+                                "attention_grid": item["attention_grid"],
+                            },
                         },
-                    })
+                    ):
+                        return
 
                 raw_answer = "".join(full_answer).strip()
                 reformat_msgs = [{
@@ -531,17 +571,21 @@ async def websocket_attention(websocket: WebSocket):
                 clean_tokens = reformat_out[0, reformat_ids.shape[1]:]
                 clean_answer = tokenizer.decode(clean_tokens, skip_special_tokens=True).strip()
 
-                await websocket.send_json({
-                    "event": "answer",
-                    "data": {
-                        "query": query,
-                        "answer": clean_answer,
-                        "sources": [
-                            {"text": doc.page_content, "metadata": doc.metadata}
-                            for doc in docs
-                        ],
+                if not await _safe_send_json(
+                    websocket,
+                    {
+                        "event": "answer",
+                        "data": {
+                            "query": query,
+                            "answer": clean_answer,
+                            "sources": [
+                                {"text": doc.page_content, "metadata": doc.metadata}
+                                for doc in docs
+                            ],
+                        },
                     },
-                })
+                ):
+                    return
             finally:
                 _ai_semaphore.release()
 
