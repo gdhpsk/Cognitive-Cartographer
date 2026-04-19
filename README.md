@@ -86,14 +86,14 @@ MAX_PDF_SIZE_MB=0
 MAX_SEQ_LEN=50
 ```
 
-| Variable | Description |
-|----------|-------------|
-| `OPENAI_API_KEY` | Required for chunk embeddings (`text-embedding-3-small`) and GPT-4o image analysis |
-| `HF_TOKEN` | Required to download Mistral-7B from Hugging Face Hub |
-| `MAX_CONCURRENT_AI_REQUESTS` | Max parallel LLM inference calls across all connected users. Excess requests queue automatically and the client receives a `queued` event with their position. Defaults to `1`. |
-| `ALLOW_CUSTOM_HF_MODELS` | If `true`, `PATCH /choose_llm` accepts any HF model ID. If `false`, only models in `/aval_model` are allowed. Defaults to `false`. |
-| `MAX_PDF_SIZE_MB` | Maximum PDF upload size in MB for `/ws/upload`. Set to `0` to disable the limit. Defaults to `0`. |
-| `MAX_SEQ_LEN` | Maximum prompt sequence length used for attention streaming. Defaults to `50`. |
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `OPENAI_API_KEY` | Yes | Required for chunk embeddings (`text-embedding-3-small`) and GPT-4o image analysis |
+| `HF_TOKEN` | Yes | Required to download Mistral-7B from Hugging Face Hub |
+| `MAX_CONCURRENT_AI_REQUESTS` | No | Max parallel LLM inference calls across all connected users. Excess requests queue automatically and the client receives a `queued` event with their position. Defaults to `1`. |
+| `ALLOW_CUSTOM_HF_MODELS` | No | If `true`, `PATCH /choose_llm` accepts any HF model ID. If `false`, only models in `/aval_model` are allowed. Defaults to `false`. |
+| `MAX_PDF_SIZE_MB` | No | Maximum PDF upload size in MB for `/ws/upload`. Set to `0` to disable the limit. Defaults to `0`. |
+| `MAX_SEQ_LEN` | No | Maximum prompt sequence length used for attention streaming. Defaults to `50`. |
 
 ### Install and Run
 
