@@ -1972,6 +1972,16 @@ export default function App() {
                   <p className="mt-1.5 text-[11px] text-muted-foreground">
                     Hostname only, no protocol. HTTPS and WSS are used automatically.
                   </p>
+                  <p className="mt-1 text-[11px] text-muted-foreground">
+                    <a
+                      href="https://github.com/gdhpsk/Cognitive-Cartographer"
+                      target="_blank"
+                      rel="noreferrer"
+                      className="text-cyan-300 underline underline-offset-2 hover:text-cyan-200"
+                    >
+                      How to get started
+                    </a>
+                  </p>
                 </div>
                 <Button
                   type="submit"
