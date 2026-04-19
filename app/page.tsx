@@ -1081,6 +1081,13 @@ function LayerOverview({
 }
 
 export default function App() {
+  const [apiHost, setApiHost] = useState<string>(() => {
+    if (typeof window !== 'undefined') {
+      return localStorage.getItem('cog-cart-api-host') || '';
+    }
+    return '';
+  });
+  const [apiHostInput, setApiHostInput] = useState(apiHost);
   const [queryText, setQueryText] = useState('');
   const [aiQuery, setAiQuery] = useState('');
   const [aiK, setAiK] = useState(10);
@@ -1172,7 +1179,7 @@ export default function App() {
   }, []);
 
   const handleAnalyzeHeatmap = useCallback(async () => {
-    if (isAnalyzing || !process.env.NEXT_PUBLIC_HOSTNAME) return;
+    if (isAnalyzing || !apiHost) return;
 
     // Find the visible heatmap canvas inside the attention popover
     const popover = document.querySelector('[data-slot="attention-popover"]');
@@ -1272,7 +1279,7 @@ export default function App() {
       formData.append('image', blob, 'attention_heatmap.png');
       formData.append('prompt', enrichedPrompt);
 
-      const res = await fetch(`https://${process.env.NEXT_PUBLIC_HOSTNAME}/image_analysis`, {
+      const res = await fetch(`${API_BASE}/image_analysis`, {
         method: 'POST',
         body: formData,
       });
@@ -1293,7 +1300,7 @@ export default function App() {
   const handleAiQuery = useCallback(() => {
     if (!aiQuery.trim() || isQuerying) return;
 
-    if (!process.env.NEXT_PUBLIC_HOSTNAME) {
+    if (!apiHost) {
       setAiAnswer('Missing NEXT_PUBLIC_HOSTNAME.');
       return;
     }
@@ -1310,7 +1317,7 @@ export default function App() {
     setAiSources([]);
     resetAttentionState();
 
-    const ws = new WebSocket(`wss://${process.env.NEXT_PUBLIC_HOSTNAME}/ws/attention`);
+    const ws = new WebSocket(`${WS_BASE}/ws/attention`);
     wsRef.current = ws;
     let completed = false;
 
@@ -1587,10 +1594,12 @@ export default function App() {
     setAiSourceNodes,
   ]);
 
-  const API_BASE = `https://${process.env.NEXT_PUBLIC_HOSTNAME}`;
+  const isLocalhost = /^(localhost|127\.0\.0\.1)(:\d+)?$/.test(apiHost);
+  const API_BASE = `${isLocalhost ? 'http' : 'https'}://${apiHost}`;
+  const WS_BASE = `${isLocalhost ? 'ws' : 'wss'}://${apiHost}`;
 
   const fetchAvailableModels = useCallback(async () => {
-    if (!process.env.NEXT_PUBLIC_HOSTNAME) {
+    if (!apiHost) {
       setModelStatus('Missing NEXT_PUBLIC_HOSTNAME.');
       return;
     }
@@ -1644,7 +1653,7 @@ export default function App() {
       );
       return;
     }
-    if (!process.env.NEXT_PUBLIC_HOSTNAME) {
+    if (!apiHost) {
       setModelStatus('Missing NEXT_PUBLIC_HOSTNAME.');
       return;
     }
@@ -1702,7 +1711,7 @@ export default function App() {
     } finally {
       setLoading(false);
     }
-  }, [loadGraph, setLoading]);
+  }, [API_BASE, loadGraph, setLoading]);
 
   const handleUploadFileSelection = useCallback((files: File[]) => {
     const file = files?.[0];
@@ -1718,7 +1727,7 @@ export default function App() {
     setIsUploading(true);
     setUploadStatus('Connecting to upload service...');
 
-    const uploadWs = new WebSocket(`wss://${process.env.NEXT_PUBLIC_HOSTNAME}/ws/upload`);
+    const uploadWs = new WebSocket(`${WS_BASE}/ws/upload`);
 
     uploadWs.onopen = () => {
       setUploadStatus('Connected. Uploading PDF bytes...');
@@ -1829,6 +1838,57 @@ export default function App() {
     }
   };
 
+  if (!apiHost) {
+    return (
+      <div className="flex h-screen w-screen items-center justify-center bg-[#050510] p-6 text-white">
+        <SpotlightCard className="w-full max-w-md rounded-xl">
+          <Card className="bg-black/60 backdrop-blur-xl border-white/10">
+            <CardHeader>
+              <CardTitle className="text-2xl font-bold text-white">Cognitive Cartographer</CardTitle>
+              <p className="text-sm text-muted-foreground">
+                Enter your backend API hostname to get started.
+              </p>
+            </CardHeader>
+            <CardContent>
+              <form
+                className="flex flex-col gap-3"
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  const trimmed = apiHostInput.trim().replace(/^https?:\/\//, '').replace(/\/+$/, '');
+                  if (!trimmed) return;
+                  localStorage.setItem('cog-cart-api-host', trimmed);
+                  setApiHost(trimmed);
+                }}
+              >
+                <div>
+                  <label className="mb-1.5 block text-xs font-medium uppercase tracking-widest text-muted-foreground">
+                    API Host
+                  </label>
+                  <Input
+                    placeholder="e.g. graph.example.com"
+                    value={apiHostInput}
+                    onChange={(e) => setApiHostInput(e.target.value)}
+                    className="bg-black/50 border-white/10 text-white placeholder:text-white/30"
+                  />
+                  <p className="mt-1.5 text-[11px] text-muted-foreground">
+                    Hostname only, no protocol. HTTPS and WSS are used automatically.
+                  </p>
+                </div>
+                <Button
+                  type="submit"
+                  disabled={!apiHostInput.trim()}
+                  className="w-full bg-cyan-500 text-black hover:bg-cyan-400 disabled:bg-secondary disabled:text-muted-foreground"
+                >
+                  Connect
+                </Button>
+              </form>
+            </CardContent>
+          </Card>
+        </SpotlightCard>
+      </div>
+    );
+  }
+
   if (!isScreenWideEnough) {
     return (
       <div className="flex h-screen w-screen items-center justify-center bg-[#050510] p-6 text-center text-white">
@@ -1863,6 +1923,20 @@ export default function App() {
                 <CardContent className="pt-0">
                   <p className="text-xs text-muted-foreground">Nodes in scene: {nodes.length}</p>
                   <p className="mt-1 text-xs text-muted-foreground">Attention: {attentionStatus}</p>
+                  <div className="mt-1.5 flex items-center gap-1.5">
+                    <p className="truncate text-[10px] text-muted-foreground/60">{apiHost}</p>
+                    <button
+                      type="button"
+                      className="shrink-0 text-[10px] text-muted-foreground/60 underline hover:text-white/80 transition-colors"
+                      onClick={() => {
+                        localStorage.removeItem('cog-cart-api-host');
+                        setApiHost('');
+                        setApiHostInput('');
+                      }}
+                    >
+                      change
+                    </button>
+                  </div>
                 </CardContent>
               </Card>
             </SpotlightCard>
