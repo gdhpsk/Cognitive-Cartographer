@@ -23,14 +23,14 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
-class SearchRequest(BaseModel):
+class SearchRequest(BaseModel):  # base model for searching
     query: str
     k: int
 
 
-load_dotenv(Path(__file__).parent / ".env")
+load_dotenv(Path(__file__).parent / ".env")  # loading my .env file information
 
-# Load local model for attention visualization
+# Loading mistral ai for the model
 model_id_local = "mistralai/Mistral-7B-Instruct-v0.3"
 device = "mps" if torch.backends.mps.is_available() else "cpu"
 tokenizer = AutoTokenizer.from_pretrained(model_id_local)
@@ -43,6 +43,7 @@ local_model = AutoModelForCausalLM.from_pretrained(
 app = FastAPI()
 
 
+# this route just to make sure it actually works
 @app.get("/health/model")
 def health_model():
     """Quick smoke test: feed one token through the local model."""
@@ -60,6 +61,7 @@ def health_model():
         return {"status": "error", "detail": str(e)}
 
 
+# middleware so the frontend can comminucate with bacekdn
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -68,24 +70,26 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
+# getting embeddings from openai
 embeddings = OpenAIEmbeddings(
     model="text-embedding-3-small",
     openai_api_key=f"{os.getenv('OPENAI_API_KEY')}",
     check_embedding_ctx_length=False,
 )
-
+# storing the vectors within the memory so it is temporary
 client = QdrantClient(path=":memory:")
-collection_name = "test_pdf_chunks"
+collection_name = "test_pdf_chunks"  # name
 
+# creating the collection of the vectors in memory
 client.create_collection(
     collection_name=collection_name,
     vectors_config=VectorParams(
-        size=1536,
-        distance=Distance.COSINE,
+        size=1536,  # dim
+        distance=Distance.COSINE,  # finding how close/far they are based off of cosin
     ),
 )
 
+# just init basically
 vectorstore = QdrantVectorStore(
     client=client,
     collection_name=collection_name,
@@ -108,19 +112,22 @@ def get_3d_positions(embeddings_2d):
     """
     X = np.array(embeddings_2d)  # converts it into a matrix
     pca = PCA(n_components=3)  # uses the matrix to convert it from 1536 to 3
-    X_3d = pca.fit_transform(X)
+    X_3d = pca.fit_transform(X)  # transform the 1536-dim embeddings into 3D
     mins = X_3d.min(
         axis=0
     )  # normalized them on the columns axis because that is the dataset axis
     maxs = X_3d.max(
         axis=0
     )  # normalized them on the columns axis because that is the dataset axis
-    ranges = maxs - mins
+    ranges = maxs - mins  # finding the range
     ranges[ranges == 0] = 1  # avoid division by zero
-    X_3d = 2 * (X_3d - mins) / ranges - 1  #
-    max_norm = np.linalg.norm(X_3d, axis=1).max()
+    X_3d = 2 * (X_3d - mins) / ranges - 1  # noemalizing the range from [-1, 1]
+    max_norm = np.linalg.norm(
+        X_3d, axis=-1
+    ).max()  # to see what the furthest point is in our dataset, doing it over the last axis which is usually the feature axis
     if max_norm > 0:
-        X_3d = X_3d / max_norm
+        X_3d = X_3d / max_norm  # scales down the points to be in between [-1, 1]
+
     return [
         {
             "x": float(X_3d[i, 0]),
@@ -131,6 +138,7 @@ def get_3d_positions(embeddings_2d):
     ]
 
 
+# the websocket to upload the pdf
 @app.websocket("/ws/upload")
 async def websocket_upload(websocket: WebSocket):
     await websocket.accept()
@@ -191,7 +199,7 @@ async def websocket_upload(websocket: WebSocket):
                 }
                 for item in chunks_data
             ]
-
+            # basically after the uploading gets and it is stored in the vector database then it deletes it so that it does not have old data
             client.delete_collection(collection_name)
             client.create_collection(
                 collection_name=collection_name,
@@ -215,132 +223,11 @@ async def websocket_upload(websocket: WebSocket):
         pass
 
 
-@app.websocket("/ws/query")
-async def websocket_query(websocket: WebSocket):
-    await websocket.accept()
-
-    try:
-
-        data = await websocket.receive_json()
-        query = data["query"]  # accessing the query given from the frontend
-        k = data.get("k", 5)
-
-        docs = vectorstore.similarity_search(query, k=k)  # the vectorstore
-        context = "\n\n".join(
-            [doc.page_content for doc in docs]
-        )  # looking at the content of the top k retrieved docs to form the context for the LLM
-
-        source_chat_ids = [doc.metadata["chat_id"] for doc in docs]
-
-        collection = client.get_collection(collection_name)
-        points = client.scroll(
-            collection_name=collection_name,
-            limit=collection.points_count,
-            with_vectors=True,
-        )[0]
-
-        chat_id_to_vec = {}
-        for point in points:
-            chat_id = point.payload["metadata"]["chat_id"]
-            vec = point.vector
-            chat_id_to_vec[chat_id] = vec
-
-        ids_sorted = sorted(chat_id_to_vec.keys())
-        X = np.array([chat_id_to_vec[i] for i in ids_sorted])
-
-        # 4. Build cosine similarity matrix
-        sim_matrix = cosine_similarity(X)
-        threshold = 0.8
-        edges = []
-        for i in range(len(ids_sorted)):
-            for j in range(i + 1, len(ids_sorted)):
-                if sim_matrix[i, j] > threshold:
-                    edges.append(
-                        {
-                            "source": f"chunk_{ids_sorted[i]}",
-                            "target": f"chunk_{ids_sorted[j]}",
-                        }
-                    )
-
-        # 5. PCA 3D positions (normalized to unit sphere)
-        pos_3d = get_3d_positions(X.tolist())
-
-        # 6. Build nodes (with `is_source` flag)
-        nodes = []
-        for i, chat_id in enumerate(ids_sorted):
-            text = next((c["text"] for c in chunks_data if c["chat_id"] == chat_id), "")
-            label = text[:60] + "..." if len(text) > 60 else text
-            nodes.append(
-                {
-                    "id": f"chunk_{chat_id}",
-                    "label": label,
-                    "text": text,
-                    "x": pos_3d[i]["x"],
-                    "y": pos_3d[i]["y"],
-                    "z": pos_3d[i]["z"],
-                    "is_source": chat_id in source_chat_ids,
-                }
-            )
-
-        # 7. Build path (simple: top k in order)
-        path = [f"chunk_{id}" for id in source_chat_ids]
-
-        # 8. Send graph & sources first (as a single big JSON)
-        await websocket.send_json(
-            {
-                "event": "graph",
-                "data": {
-                    "nodes": nodes,
-                    "edges": edges,
-                    "path": path,
-                    "sim_matrix": sim_matrix.tolist(),  # optional for advanced animations
-                },
-            }
-        )
-
-        # Generate answer with Mistral
-        msgs = [
-            {
-                "role": "system",
-                "content": f"Answer using the provided context. If unknown, say you don't know.\n\nContext:\n{context}",
-            },
-            {"role": "user", "content": query},
-        ]
-        input_ids = tokenizer.apply_chat_template(msgs, return_tensors="pt")
-        if not isinstance(input_ids, torch.Tensor):
-            input_ids = input_ids["input_ids"]
-        if input_ids.dim() == 1:
-            input_ids = input_ids.unsqueeze(0)
-        input_ids = input_ids.to(device)
-
-        with torch.no_grad():
-            output_ids = local_model.generate(input_ids, max_new_tokens=200)
-        # Decode only the new tokens (skip the prompt)
-        new_tokens = output_ids[0, input_ids.shape[1] :]
-        answer_text = tokenizer.decode(new_tokens, skip_special_tokens=True)
-
-        await websocket.send_json(
-            {
-                "event": "answer",
-                "data": {
-                    "query": query,
-                    "answer": answer_text,
-                    "sources": [
-                        {"text": doc.page_content, "metadata": doc.metadata}
-                        for doc in docs
-                    ],
-                },
-            }
-        )
-
-    except WebSocketDisconnect:
-        pass
-
-
+# Creating the graph of the chunks based on their embeddings
 @app.get("/graph")
 def get_graph():
 
-    collection = client.get_collection(collection_name)  # getting the full collectio
+    collection = client.get_collection(collection_name)  # getting the full collection
     points = client.scroll(  # getting the information and the embedding vectors
         collection_name=collection_name,
         limit=collection.points_count,
@@ -358,7 +245,9 @@ def get_graph():
     ids_sorted = sorted(
         chat_id_to_vec.keys()
     )  # sorting the ids so that the node order is consistent
-    X = np.array([chat_id_to_vec[i] for i in ids_sorted])
+    X = np.array(
+        [chat_id_to_vec[i] for i in ids_sorted]
+    )  # converting to np arry for similarity
 
     # 3. Compute cosine similarity matrix (for edges)
     sim_matrix = cosine_similarity(
@@ -368,7 +257,7 @@ def get_graph():
     edges = []
     for i in range(len(ids_sorted)):
         for j in range(i + 1, len(ids_sorted)):
-            if sim_matrix[i, j] > threshold:
+            if sim_matrix[i, j] > threshold:  # checking if it is above this threshold
                 edges.append(
                     {
                         "source": f"chunk_{ids_sorted[i]}",
@@ -383,9 +272,11 @@ def get_graph():
     nodes = []
     for i, chat_id in enumerate(ids_sorted):
         text = next((c["text"] for c in chunks_data if c["chat_id"] == chat_id), "")
-        label = text[:60] + "..." if len(text) > 60 else text
+        label = (
+            text[:60] + "..." if len(text) > 60 else text
+        )  # basically if needed it will truncate the data
         nodes.append(
-            {
+            {  # appending the node as this is what is getting returned
                 "id": f"chunk_{chat_id}",
                 "label": label,
                 "text": text,
@@ -395,47 +286,64 @@ def get_graph():
             }
         )
 
-    return {
+    return {  # the actual jsong getting returned
         "nodes": nodes,
         "edges": edges,
     }
 
 
-MAX_SEQ_LEN = 50
+MAX_SEQ_LEN = 25  # how detailed the attention windo is
 MAX_NEW_TOKENS = 10
 
 
 def generate_with_attention(input_ids, max_new_tokens, queue, loop):
     """Generate tokens one at a time, pushing attention matrices into a queue."""
-    eos_token_id = tokenizer.eos_token_id
+    eos_token_id = tokenizer.eos_token_id  # the end of generating string
     current_ids = input_ids
 
-    with torch.no_grad():
-        for step in range(max_new_tokens):
-            outputs = local_model(current_ids, output_attentions=True)
+    with torch.no_grad():  # disables gradient tracking as we are not doing back prop
+        for step in range(
+            max_new_tokens
+        ):  # basically just forward prop and extracting the attention
+            outputs = local_model(
+                current_ids, output_attentions=True
+            )  # just accessing the output_attention
 
             # Pick next token
-            logits = outputs.logits[:, -1, :]
-            next_token_id = logits.argmax(dim=-1, keepdim=True)
+            logits = outputs.logits[:, -1, :]  # getting the last token position
+            next_token_id = logits.argmax(
+                dim=-1, keepdim=True
+            )  # keepdim true is how we get the 1,1 otherise it would just be 1, argsmax bssically finds the index of the highest value in the logits as it is the highest probability token
             next_token_str = tokenizer.decode(
-                next_token_id[0], skip_special_tokens=False
+                next_token_id[0],
+                skip_special_tokens=False,  # basically just decoding and seeing if we want to keep special tokens or not
             )
 
             # Extract full attention: each layer is (1, num_heads, seq_len, seq_len)
             # Only keep the last MAX_SEQ_LEN tokens' attention to stay bounded
             seq_len = current_ids.shape[1]
-            start = max(0, seq_len - MAX_SEQ_LEN)
+            start = max(
+                0, seq_len - MAX_SEQ_LEN
+            )  # finding the start index in case the sequence length exceeds the maximum attention window
 
             attention_grid = []
             for layer_attn in outputs.attentions:
                 # Slice to last MAX_SEQ_LEN rows and cols
-                sliced = layer_attn[0, :, start:, start:]  # (num_heads, <=10, <=10)
-                heads = sliced.cpu().tolist()
+                sliced = layer_attn[
+                    0, :, start:, start:
+                ]  # removes the batch dimension as it is one and not neccessary for visualization
+                heads = (
+                    sliced.cpu().tolist()
+                )  # changes from mps to cpu and then converts it into an nested python list becomes a list of attention matrices
                 attention_grid.append(heads)
 
             # Get the token labels for the visible window
-            visible_ids = current_ids[0, start:]
-            visible_tokens = tokenizer.convert_ids_to_tokens(visible_ids)
+            visible_ids = current_ids[
+                0, start:
+            ]  # makes batch dimension disappear so we just have the sequence of token ids
+            visible_tokens = tokenizer.convert_ids_to_tokens(
+                visible_ids
+            )  # converts tokens back to actual characthers
 
             asyncio.run_coroutine_threadsafe(
                 queue.put(
@@ -447,14 +355,18 @@ def generate_with_attention(input_ids, max_new_tokens, queue, loop):
                         "attention_grid": attention_grid,
                     }
                 ),
-                loop,
+                loop,  # to let the asyncio event loop to know which async system to send it to
             )
 
-            current_ids = torch.cat([current_ids, next_token_id], dim=-1)
+            current_ids = torch.cat(
+                [current_ids, next_token_id], dim=-1
+            )  # appends the generated token to the current sequence
             if next_token_id.item() == eos_token_id:
-                break
+                break  # stop generation if we hit the end of sequence token
 
-    asyncio.run_coroutine_threadsafe(queue.put(None), loop)
+    asyncio.run_coroutine_threadsafe(
+        queue.put(None), loop
+    )  # sends the frontend to let thm know it is done
 
 
 @app.websocket("/ws/attention")
@@ -488,6 +400,7 @@ async def websocket_attention(websocket: WebSocket):
 
             ids_sorted = sorted(chat_id_to_vec.keys())
             X = np.array([chat_id_to_vec[i] for i in ids_sorted])
+            # num_chunk, 1536
 
             sim_matrix = cosine_similarity(X)
             threshold = 0.8
