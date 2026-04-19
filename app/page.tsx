@@ -1838,6 +1838,8 @@ export default function App() {
         setSessionId(null);
         setUploadSocket(null);
         setHasUploadedPdf(false);
+        setAiAnswer(null);
+        setAiSources([]);
         setSessionLost(true);
       }
     };
@@ -2079,7 +2081,7 @@ export default function App() {
                   <p className="mt-1.5 text-[11px] text-muted-foreground">The graph has loaded. You can explore it while waiting.</p>
                 </CardContent>
               </Card>
-            ) : aiAnswer !== null ? (
+            ) : aiAnswer !== null && !sessionLost ? (
               <Card className="flex h-[min(400px,calc(100vh-200px))] flex-col overflow-hidden bg-black/60 backdrop-blur-xl border-white/10">
                 <CardHeader className="shrink-0 pb-0">
                   <div className="flex items-center justify-between">
