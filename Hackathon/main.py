@@ -84,9 +84,7 @@ async def image_analysis(
                     {"type": "text", "text": prompt},
                     {
                         "type": "image_url",
-                        "image_url": {
-                            "url": f"data:{mime_type};base64,{b64_image}"
-                        },
+                        "image_url": {"url": f"data:{mime_type};base64,{b64_image}"},
                     },
                 ],
             }
@@ -364,7 +362,7 @@ def get_graph():
     }
 
 
-MAX_SEQ_LEN = 25  # how detailed the attention windo is
+MAX_SEQ_LEN = 100  # how detailed the attention windo is
 MAX_NEW_TOKENS = 10
 
 
