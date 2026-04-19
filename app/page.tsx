@@ -1809,8 +1809,19 @@ export default function App() {
         if (typeof parsed?.data === 'string') setUploadStatus(parsed.data);
         if (parsed?.event === 'done') {
           const sid = typeof parsed.session_id === 'string' ? parsed.session_id : null;
+          if (!sid) {
+            const message = 'Upload completed but no session token was returned. Please try uploading again.';
+            setUploadErrorMessage(message);
+            setUploadStatus(message);
+            setHasUploadedPdf(false);
+            setPendingUploadFile(pendingUploadFile);
+            setIsUploading(false);
+            return;
+          }
+
           sessionSaved = true;
           setSessionId(sid);
+          setSessionLost(false);
           setUploadSocket(uploadWs);
           setHasUploadedPdf(true);
           setPendingUploadFile(null);
@@ -1840,8 +1851,6 @@ export default function App() {
         setHasUploadedPdf(false);
         setPendingUploadFile(pendingUploadFile);
         setUploadStatus(`Session closed. Ready to re-upload: ${pendingUploadFile.name}`);
-        setAiAnswer(null);
-        setAiSources([]);
         setSessionLost(true);
       }
     };
