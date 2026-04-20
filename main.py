@@ -93,7 +93,10 @@ def encode_image(file):
 
 
 def _websocket_connected(websocket: WebSocket) -> bool:
-    return websocket.client_state == WebSocketState.CONNECTED
+    return (
+        websocket.client_state == WebSocketState.CONNECTED
+        and websocket.application_state == WebSocketState.CONNECTED
+    )
 
 
 async def _safe_send_json(websocket: WebSocket, payload: dict) -> bool:
@@ -102,7 +105,11 @@ async def _safe_send_json(websocket: WebSocket, payload: dict) -> bool:
     try:
         await websocket.send_json(payload)
         return True
-    except (WebSocketDisconnect, RuntimeError):
+    except Exception:
+        # Any exception from send_json means the connection is gone.
+        # With websockets-sansio the backend raises ConnectionClosed* rather than
+        # RuntimeError, and state updates lazily on the next receive — so we can't
+        # reliably re-raise only "real" errors here.
         return False
 
 
@@ -431,41 +438,44 @@ def generate_with_attention(input_ids, max_new_tokens, queue, loop):
     eos_token_id = tokenizer.eos_token_id
     current_ids = input_ids
 
-    with torch.no_grad():
-        for step in range(max_new_tokens):
-            outputs = local_model(current_ids, output_attentions=True)
+    try:
+        with torch.no_grad():
+            for step in range(max_new_tokens):
+                outputs = local_model(current_ids, output_attentions=True)
 
-            logits = outputs.logits[:, -1, :]
-            next_token_id = logits.argmax(dim=-1, keepdim=True)
-            next_token_str = tokenizer.decode(next_token_id[0], skip_special_tokens=False)
+                logits = outputs.logits[:, -1, :]
+                next_token_id = logits.argmax(dim=-1, keepdim=True)
+                next_token_str = tokenizer.decode(next_token_id[0], skip_special_tokens=False)
 
-            seq_len = current_ids.shape[1]
-            start = max(0, seq_len - MAX_SEQ_LEN)
+                seq_len = current_ids.shape[1]
+                start = max(0, seq_len - MAX_SEQ_LEN)
 
-            attention_grid = []
-            for layer_attn in outputs.attentions:
-                sliced = layer_attn[0, :, start:, start:]
-                attention_grid.append(sliced.cpu().tolist())
+                attention_grid = []
+                for layer_attn in outputs.attentions:
+                    sliced = layer_attn[0, :, start:, start:]
+                    attention_grid.append(sliced.cpu().tolist())
 
-            visible_ids = current_ids[0, start:]
-            visible_tokens = tokenizer.convert_ids_to_tokens(visible_ids)
+                visible_ids = current_ids[0, start:]
+                visible_tokens = tokenizer.convert_ids_to_tokens(visible_ids)
 
-            asyncio.run_coroutine_threadsafe(
-                queue.put({
-                    "step": step,
-                    "token": next_token_str,
-                    "tokens": visible_tokens,
-                    "seq_len": len(visible_tokens),
-                    "attention_grid": attention_grid,
-                }),
-                loop,
-            )
+                asyncio.run_coroutine_threadsafe(
+                    queue.put({
+                        "step": step,
+                        "token": next_token_str,
+                        "tokens": visible_tokens,
+                        "seq_len": len(visible_tokens),
+                        "attention_grid": attention_grid,
+                    }),
+                    loop,
+                )
 
-            current_ids = torch.cat([current_ids, next_token_id], dim=-1)
-            if next_token_id.item() == eos_token_id:
-                break
-
-    asyncio.run_coroutine_threadsafe(queue.put(None), loop)
+                current_ids = torch.cat([current_ids, next_token_id], dim=-1)
+                if next_token_id.item() == eos_token_id:
+                    break
+    except Exception as e:
+        asyncio.run_coroutine_threadsafe(queue.put({"error": str(e)}), loop)
+    finally:
+        asyncio.run_coroutine_threadsafe(queue.put(None), loop)
 
 
 @app.websocket("/ws/attention")
@@ -499,7 +509,7 @@ async def websocket_attention(websocket: WebSocket):
             context = "\n\n".join([doc.page_content for doc in docs])
             source_chat_ids = [doc.metadata["chat_id"] for doc in docs]
 
-            nodes, edges, sim_matrix = build_graph(session_id, threshold=0.8, mark_sources=source_chat_ids)
+            nodes, edges, _ = build_graph(session_id, threshold=0.8, mark_sources=source_chat_ids)
             path = [f"chunk_{id}" for id in source_chat_ids]
 
             if not await _safe_send_json(
@@ -510,7 +520,6 @@ async def websocket_attention(websocket: WebSocket):
                         "nodes": nodes,
                         "edges": edges,
                         "path": path,
-                        "sim_matrix": sim_matrix,
                     },
                 },
             ):
@@ -561,13 +570,18 @@ async def websocket_attention(websocket: WebSocket):
                     return
 
                 queue = asyncio.Queue()
-                loop = asyncio.get_event_loop()
+                loop = asyncio.get_running_loop()
                 loop.run_in_executor(None, generate_with_attention, input_ids, max_tokens, queue, loop)
 
                 full_answer = []
+                generation_error = None
                 while True:
                     item = await queue.get()
                     if item is None:
+                        break
+
+                    if "error" in item:
+                        generation_error = item["error"]
                         break
 
                     full_answer.append(item["token"])
@@ -588,22 +602,42 @@ async def websocket_attention(websocket: WebSocket):
                     ):
                         return
 
-                raw_answer = "".join(full_answer).strip()
-                reformat_msgs = [{
-                    "role": "user",
-                    "content": f"Rewrite the following text clearly and concisely in plain English. Do not add any new information, just clean up the formatting:\n\n{raw_answer}",
-                }]
-                reformat_ids = tokenizer.apply_chat_template(reformat_msgs, return_tensors="pt")
-                if not isinstance(reformat_ids, torch.Tensor):
-                    reformat_ids = reformat_ids["input_ids"]
-                if reformat_ids.dim() == 1:
-                    reformat_ids = reformat_ids.unsqueeze(0)
-                reformat_ids = reformat_ids.to(device)
+                if generation_error:
+                    if not await _safe_send_json(
+                        websocket,
+                        {"event": "error", "data": f"Answer generation failed: {generation_error}"},
+                    ):
+                        return
+                    if not full_answer:
+                        continue
 
-                with torch.no_grad():
-                    reformat_out = local_model.generate(reformat_ids, max_new_tokens=300)
-                clean_tokens = reformat_out[0, reformat_ids.shape[1]:]
-                clean_answer = tokenizer.decode(clean_tokens, skip_special_tokens=True).strip()
+                raw_answer = "".join(full_answer).strip()
+                clean_answer = raw_answer
+                if raw_answer:
+                    try:
+                        reformat_msgs = [{
+                            "role": "user",
+                            "content": f"Rewrite the following text clearly and concisely in plain English. Do not add any new information, just clean up the formatting:\n\n{raw_answer}",
+                        }]
+                        reformat_ids = tokenizer.apply_chat_template(reformat_msgs, return_tensors="pt")
+                        if not isinstance(reformat_ids, torch.Tensor):
+                            reformat_ids = reformat_ids["input_ids"]
+                        if reformat_ids.dim() == 1:
+                            reformat_ids = reformat_ids.unsqueeze(0)
+                        reformat_ids = reformat_ids.to(device)
+
+                        def _generate_reformat():
+                            with torch.no_grad():
+                                return local_model.generate(reformat_ids, max_new_tokens=300)
+
+                        reformat_out = await loop.run_in_executor(None, _generate_reformat)
+                        clean_tokens = reformat_out[0, reformat_ids.shape[1]:]
+                        clean_answer = tokenizer.decode(clean_tokens, skip_special_tokens=True).strip()
+                    except Exception as e:
+                        await _safe_send_json(
+                            websocket,
+                            {"event": "error", "data": f"Answer reformat failed. Sending raw answer. Detail: {e}"},
+                        )
 
                 if not await _safe_send_json(
                     websocket,
@@ -623,5 +657,5 @@ async def websocket_attention(websocket: WebSocket):
             finally:
                 _ai_semaphore.release()
 
-    except WebSocketDisconnect:
+    except (WebSocketDisconnect, RuntimeError):
         pass
