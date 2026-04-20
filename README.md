@@ -127,7 +127,7 @@ pip install -r requirements.txt
 python -c "import nltk; nltk.download('punkt'); nltk.download('punkt_tab')"
 
 # Start the server
-uvicorn main:app --host 0.0.0.0 --port 8000 --ws websockets-sansio
+uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
 Mistral-7B-Instruct-v0.3 (~13 GB) will download from Hugging Face on first startup. Subsequent starts load from the local cache.
