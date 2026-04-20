@@ -1083,13 +1083,9 @@ function LayerOverview({
 }
 
 export default function App() {
-  const [apiHost, setApiHost] = useState<string>(() => {
-    if (typeof window !== 'undefined') {
-      return localStorage.getItem('cog-cart-api-host') || '';
-    }
-    return '';
-  });
-  const [apiHostInput, setApiHostInput] = useState(apiHost);
+  const [mounted, setMounted] = useState(false);
+  const [apiHost, setApiHost] = useState('');
+  const [apiHostInput, setApiHostInput] = useState('');
   const [queryText, setQueryText] = useState('');
   const [aiQuery, setAiQuery] = useState('');
   const [aiK, setAiK] = useState(10);
@@ -1124,6 +1120,7 @@ export default function App() {
   const [heatmapVersion, setHeatmapVersion] = useState(0);
   const [uploadStatus, setUploadStatus] = useState<string>('');
   const [uploadErrorMessage, setUploadErrorMessage] = useState<string | null>(null);
+  const [graphLoadError, setGraphLoadError] = useState<string | null>(null);
   const [isUploading, setIsUploading] = useState(false);
   const [hasUploadedPdf, setHasUploadedPdf] = useState(false);
   const [sessionLost, setSessionLost] = useState(false);
@@ -1192,6 +1189,7 @@ export default function App() {
 
     // Find the visible heatmap canvas inside the attention popover
     const popover = document.querySelector('[data-slot="attention-popover"]');
+    console.log(popover)
     if (!popover) return;
 
     // Grab all heatmap canvases currently rendered in the visualization area
@@ -1331,6 +1329,28 @@ export default function App() {
     wsRef.current = ws;
     let completed = false;
 
+    const closeAttentionSocket = () => {
+      if (wsRef.current === ws) {
+        wsRef.current = null;
+      }
+
+      if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+        try {
+          ws.close(1000, 'Attention stream complete');
+        } catch {
+          // Ignore close errors; onclose/onerror will handle final cleanup.
+        }
+      }
+    };
+
+    const finishAttentionQuery = (status: string) => {
+      completed = true;
+      setQueuePosition(null);
+      setIsQuerying(false);
+      setAttentionStatus(status);
+      closeAttentionSocket();
+    };
+
     ws.onopen = () => {
       setAttentionStatus('Connected. Streaming attention heads...');
       ws.send(JSON.stringify({ query: aiQuery.trim(), k: aiK, max_tokens: maxTokens, session_id: useAppStore.getState().sessionId }));
@@ -1341,8 +1361,13 @@ export default function App() {
         const msg = JSON.parse(event.data) as unknown;
         if (!isRecord(msg)) return;
 
-        const eventName = typeof msg.event === 'string' ? msg.event : '';
+        const eventName = typeof msg.event === 'string' ? msg.event.trim().toLowerCase() : '';
         const data = msg.data;
+
+        if (eventName === 'status' && typeof data === 'string') {
+          setAttentionStatus(data);
+          return;
+        }
 
         if (eventName === 'graph' && isRecord(data)) {
           const rawNodes = Array.isArray(data.nodes) ? data.nodes : [];
@@ -1543,53 +1568,15 @@ export default function App() {
           setAiAnswer(answer);
           setAiSources(sources);
           pinSourceNodes(sources);
-          setAttentionStatus('Answer received. Generation complete.');
-          completed = true;
-          setIsQuerying(false);
-          ws.close();
+          finishAttentionQuery('Analysis complete. Final answer received.');
           return;
         }
 
         if (eventName === 'error') {
           const errorMsg = typeof data === 'string' ? data : (isRecord(data) && typeof data.message === 'string' ? data.message : 'An error occurred.');
-          setQueuePosition(null);
           setAiAnswer(errorMsg);
-          setAttentionStatus('Error from server.');
-          completed = true;
-          setIsQuerying(false);
-          ws.close();
+          finishAttentionQuery('Error from server.');
           return;
-        }
-
-        if (eventName === 'attention_done' && isRecord(data)) {
-          const layers = toPositiveInt(
-            data.total_layers,
-            toPositiveInt(data.num_layers, totalLayersRef.current || 0)
-          );
-          const heads = toPositiveInt(
-            data.total_heads,
-            toPositiveInt(data.num_heads, totalHeadsRef.current || 0)
-          );
-
-          totalLayersRef.current = layers;
-          totalHeadsRef.current = heads;
-
-          if (layers > 0 && heads > 0) {
-            ensureHeatmapGrid(
-              heatmapsRef.current,
-              layers,
-              heads,
-              Math.max(1, seqLenRef.current)
-            );
-          }
-
-          setTotalLayers(layers);
-          setTotalHeads(heads);
-          setHeatmapVersion((v) => v + 1);
-          setAttentionStatus(`Attention complete: ${layers} layers x ${heads} heads.`);
-          completed = true;
-          setIsQuerying(false);
-          ws.close();
         }
       } catch {
         setAttentionStatus('Received malformed websocket payload.');
@@ -1597,6 +1584,7 @@ export default function App() {
     };
 
     ws.onerror = () => {
+      if (completed) return;
       setQueuePosition(null);
       setAiAnswer('Failed to connect to attention service.');
       setAttentionStatus('WebSocket error while streaming attention.');
@@ -1719,6 +1707,7 @@ export default function App() {
   const handleLoadGraph = useCallback(async () => {
     const currentSessionId = useAppStore.getState().sessionId;
     if (!currentSessionId) return;
+    setGraphLoadError(null);
     setLoading(true);
     try {
       const res = await fetch(`${API_BASE}/graph?session_id=${encodeURIComponent(currentSessionId)}`);
@@ -1735,8 +1724,9 @@ export default function App() {
         targetId: e.target,
       }));
       loadGraph(graphNodes, graphEdges);
+      setGraphLoadError(null);
     } catch (err) {
-      console.error('Failed to load graph:', err);
+      setGraphLoadError(err instanceof Error ? err.message : 'Failed to load graph. Is the server running?');
     } finally {
       setLoading(false);
     }
@@ -1887,6 +1877,13 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    const saved = localStorage.getItem('cog-cart-api-host') || '';
+    setApiHost(saved);
+    setApiHostInput(saved);
+    setMounted(true);
+  }, []);
+
+  useEffect(() => {
     void fetchAvailableModels();
   }, [fetchAvailableModels]);
 
@@ -1929,7 +1926,14 @@ export default function App() {
 
     const dx = event.clientX - dragState.startX;
     const dy = event.clientY - dragState.startY;
-    setQueryCardOffset({ x: dragState.originX + dx, y: dragState.originY + dy });
+    const rawX = dragState.originX + dx;
+    const rawY = dragState.originY + dy;
+    // Card is anchored bottom-right; negative values move it toward center.
+    // Clamp so at least 80px of the card stays inside the viewport on each axis.
+    const margin = 80;
+    const clampedX = Math.min(0, Math.max(rawX, -(window.innerWidth - margin)));
+    const clampedY = Math.min(0, Math.max(rawY, -(window.innerHeight - margin)));
+    setQueryCardOffset({ x: clampedX, y: clampedY });
   };
 
   const handleQueryCardDragEnd = (event: React.PointerEvent<HTMLDivElement>) => {
@@ -1942,6 +1946,8 @@ export default function App() {
       event.currentTarget.releasePointerCapture(event.pointerId);
     }
   };
+
+  if (!mounted) return null;
 
   if (!apiHost) {
     return (
@@ -2099,7 +2105,7 @@ export default function App() {
                   <p className="mt-1.5 text-[11px] text-muted-foreground">The graph has loaded. You can explore it while waiting.</p>
                 </CardContent>
               </Card>
-            ) : aiAnswer !== null && !sessionLost ? (
+            ) : aiAnswer !== null ? (
               <Card className="flex h-[min(400px,calc(100vh-200px))] flex-col overflow-hidden bg-black/60 backdrop-blur-xl border-white/10">
                 <CardHeader className="shrink-0 pb-0">
                   <div className="flex items-center justify-between">
@@ -2219,7 +2225,7 @@ export default function App() {
           <div className="pointer-events-none absolute bottom-0 left-1/2 -translate-x-1/2">
             <div className="pointer-events-auto flex flex-wrap items-end justify-center gap-3">
               <Card className="bg-black/60 backdrop-blur-xl border-white/10">
-                <CardContent className="p-3">
+                <CardContent className="p-3 flex flex-col gap-1.5">
                   <Button
                     variant={isLoading || isUploading || !sessionId ? 'secondary' : 'default'}
                     disabled={isLoading || isUploading || !sessionId}
@@ -2229,6 +2235,9 @@ export default function App() {
                   >
                     {isLoading ? 'Loading...' : 'Load Graph'}
                   </Button>
+                  {graphLoadError && (
+                    <p className="max-w-40 text-[10px] leading-tight text-red-400">{graphLoadError}</p>
+                  )}
                 </CardContent>
               </Card>
 
@@ -2256,12 +2265,26 @@ export default function App() {
                       setActiveNodes([...matchedIds]);
                     }}
                   >
-                    <Input
-                      placeholder="Search nodes..."
-                      value={queryText}
-                      onChange={(e) => setQueryText(e.target.value)}
-                      className="w-50 bg-black/50 border-white/10 text-white placeholder:text-white/40"
-                    />
+                    <div className="relative">
+                      <Input
+                        placeholder="Search nodes..."
+                        value={queryText}
+                        onChange={(e) => setQueryText(e.target.value)}
+                        className="w-50 bg-black/50 border-white/10 text-white placeholder:text-white/40 pr-6"
+                      />
+                      {queryText && (
+                        <button
+                          type="button"
+                          className="absolute right-1.5 top-1/2 -translate-y-1/2 text-white/40 hover:text-white/80 transition-colors"
+                          onClick={() => {
+                            setQueryText('');
+                            setActiveNodes([]);
+                          }}
+                        >
+                          ✕
+                        </button>
+                      )}
+                    </div>
                     <Button
                       type="submit"
                       disabled={nodes.length === 0}
@@ -2419,7 +2442,15 @@ export default function App() {
                     title={!sessionId ? 'Upload a document first' : undefined}
                     className="self-start bg-purple-500 text-white hover:bg-purple-400 disabled:bg-secondary disabled:text-muted-foreground"
                   >
-                    {isQuerying ? 'Thinking...' : 'Ask AI'}
+                    {isQuerying ? (
+                      <span className="flex items-center gap-1.5">
+                        <svg className="size-3 animate-spin" viewBox="0 0 24 24" fill="none">
+                          <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                          <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z" />
+                        </svg>
+                        Thinking...
+                      </span>
+                    ) : 'Ask AI'}
                   </Button>
                 </form>
               </CardContent>

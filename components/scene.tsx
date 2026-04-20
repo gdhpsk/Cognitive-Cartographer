@@ -1,12 +1,13 @@
 'use client';
 
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, useMemo } from 'react';
 import { Canvas, useFrame, useThree } from '@react-three/fiber';
 import { OrbitControls, Text, Line } from '@react-three/drei';
 import gsap from 'gsap';
 import { useAppStore, type NodeData, type EdgeData } from '@/helpers/store';
 import * as THREE from 'three';
 import { forceSimulation, forceLink, forceManyBody, forceCenter, forceRadial, type SimulationNode, type SimulationLink } from 'd3-force-3d';
+import type { OrbitControls as OrbitControlsImpl } from 'three-stdlib';
 
 interface SimNode extends SimulationNode {
   id: string;
@@ -27,6 +28,11 @@ const SOFT_BOUNDARY_RADIUS = 7.2;
 const OVERFLOW_PULL = 0.24;
 const CYLINDER_BASE_DIR = new THREE.Vector3(0, 1, 0);
 const SELECTED_EDGE_RADIUS = 0.02;
+// Scratch Vector3s reused every frame to avoid GC pressure
+const _edgeStart = new THREE.Vector3();
+const _edgeEnd = new THREE.Vector3();
+const _edgeDir = new THREE.Vector3();
+const _edgeMid = new THREE.Vector3();
 
 function ForceGraph({ nodes, edges, simNodesRefOut }: { nodes: NodeData[]; edges: EdgeData[]; simNodesRefOut?: React.RefObject<SimNode[]> }) {
   const meshRefs = useRef<Map<string, THREE.Mesh>>(new Map());
@@ -41,8 +47,8 @@ function ForceGraph({ nodes, edges, simNodesRefOut }: { nodes: NodeData[]; edges
   const selectedEdgeMeshRef = useRef<THREE.InstancedMesh>(null);
   const selectedEdgeDummyRef = useRef<THREE.Object3D>(new THREE.Object3D());
   const tooltipRef = useRef<THREE.Group>(null);
-  const tooltipLabelRef = useRef<any>(null);
-  const tooltipCoordsRef = useRef<any>(null);
+  const tooltipLabelRef = useRef<{ text: string } | null>(null);
+  const tooltipConnRef = useRef<{ text: string } | null>(null);
 
   const [hoveredId, setHoveredId] = useState<string | null>(null);
 
@@ -120,7 +126,7 @@ function ForceGraph({ nodes, edges, simNodesRefOut }: { nodes: NodeData[]; edges
 
     if (!sim || simNodes.length === 0) return;
 
-    sim.tick();
+    if (sim.alpha() > sim.alphaMin()) sim.tick();
 
     // Keep nodes from accumulating on the outer shell by nudging overflow inward.
     for (const sn of simNodes) {
@@ -289,10 +295,6 @@ function ForceGraph({ nodes, edges, simNodesRefOut }: { nodes: NodeData[]; edges
     const selectedEdgeMesh = selectedEdgeMeshRef.current;
     if (selectedEdgeMesh) {
       const dummy = selectedEdgeDummyRef.current;
-      const start = new THREE.Vector3();
-      const end = new THREE.Vector3();
-      const dir = new THREE.Vector3();
-      const mid = new THREE.Vector3();
       let selectedCount = 0;
 
       for (let i = 0; i < simLinks.length; i++) {
@@ -302,15 +304,15 @@ function ForceGraph({ nodes, edges, simNodesRefOut }: { nodes: NodeData[]; edges
         if (!src || !tgt) continue;
         if (!(selectedNodeId !== null && (src.id === selectedNodeId || tgt.id === selectedNodeId))) continue;
 
-        start.set(src.x ?? 0, src.y ?? 0, src.z ?? 0);
-        end.set(tgt.x ?? 0, tgt.y ?? 0, tgt.z ?? 0);
-        dir.subVectors(end, start);
-        const length = dir.length();
+        _edgeStart.set(src.x ?? 0, src.y ?? 0, src.z ?? 0);
+        _edgeEnd.set(tgt.x ?? 0, tgt.y ?? 0, tgt.z ?? 0);
+        _edgeDir.subVectors(_edgeEnd, _edgeStart);
+        const length = _edgeDir.length();
         if (length < 1e-6) continue;
 
-        mid.copy(start).add(end).multiplyScalar(0.5);
-        dummy.position.copy(mid);
-        dummy.quaternion.setFromUnitVectors(CYLINDER_BASE_DIR, dir.normalize());
+        _edgeMid.copy(_edgeStart).add(_edgeEnd).multiplyScalar(0.5);
+        dummy.position.copy(_edgeMid);
+        dummy.quaternion.setFromUnitVectors(CYLINDER_BASE_DIR, _edgeDir.normalize());
         dummy.scale.set(1, length, 1);
         dummy.updateMatrix();
 
@@ -346,9 +348,10 @@ function ForceGraph({ nodes, edges, simNodesRefOut }: { nodes: NodeData[]; edges
             setHoveredId(node.id);
             // Set initial tooltip text on hover start
             const sn = simNodesRef.current.find((n) => n.id === node.id);
-            if (sn && tooltipLabelRef.current && tooltipCoordsRef.current) {
+            if (sn && tooltipLabelRef.current && tooltipConnRef.current) {
               tooltipLabelRef.current.text = sn.label;
-              tooltipCoordsRef.current.text = `(${(sn.x ?? 0).toFixed(2)}, ${(sn.y ?? 0).toFixed(2)}, ${(sn.z ?? 0).toFixed(2)})`;
+              const degree = edges.filter((e) => e.sourceId === sn.id || e.targetId === sn.id).length;
+              tooltipConnRef.current.text = `${degree} connection${degree !== 1 ? 's' : ''}`;
             }
           }}
           onPointerOut={() => setHoveredId(null)}
@@ -398,7 +401,7 @@ function ForceGraph({ nodes, edges, simNodesRefOut }: { nodes: NodeData[]; edges
         <Text ref={tooltipLabelRef} position={[0, 0.35, 0]} fontSize={0.25} color="white" anchorY="bottom">
           {''}
         </Text>
-        <Text ref={tooltipCoordsRef} position={[0, 0.12, 0]} fontSize={0.15} color="#aaaaaa" anchorY="bottom">
+        <Text ref={tooltipConnRef} position={[0, 0.12, 0]} fontSize={0.15} color="#aaaaaa" anchorY="bottom">
           {''}
         </Text>
       </group>
@@ -410,17 +413,20 @@ const AXIS_LENGTH = 8;
 const TICK_SIZE = 0.15;
 
 function AxisTicks({ axis }: { axis: 'x' | 'y' | 'z' }) {
-  const ticks: [number, number, number][][] = [];
-  for (let i = -AXIS_LENGTH; i <= AXIS_LENGTH; i++) {
-    if (i === 0) continue;
-    if (axis === 'x') {
-      ticks.push([[i, -TICK_SIZE, 0], [i, TICK_SIZE, 0]]);
-    } else if (axis === 'y') {
-      ticks.push([[-TICK_SIZE, i, 0], [TICK_SIZE, i, 0]]);
-    } else {
-      ticks.push([[0, -TICK_SIZE, i], [0, TICK_SIZE, i]]);
+  const ticks = useMemo(() => {
+    const result: [number, number, number][][] = [];
+    for (let i = -AXIS_LENGTH; i <= AXIS_LENGTH; i++) {
+      if (i === 0) continue;
+      if (axis === 'x') {
+        result.push([[i, -TICK_SIZE, 0], [i, TICK_SIZE, 0]]);
+      } else if (axis === 'y') {
+        result.push([[-TICK_SIZE, i, 0], [TICK_SIZE, i, 0]]);
+      } else {
+        result.push([[0, -TICK_SIZE, i], [0, TICK_SIZE, i]]);
+      }
     }
-  }
+    return result;
+  }, [axis]);
   return (
     <>
       {ticks.map((pts, i) => (
@@ -450,7 +456,7 @@ const SELECTED_CAM_BEHIND = 4; // how far behind the node the camera sits
 
 function CameraController({ simNodesRef, controlsRef }: {
   simNodesRef: React.RefObject<SimNode[]>;
-  controlsRef: React.RefObject<any>;
+  controlsRef: React.RefObject<OrbitControlsImpl | null>;
 }) {
   const { camera } = useThree();
 
@@ -578,7 +584,7 @@ function CameraController({ simNodesRef, controlsRef }: {
 export default function Scene() {
   const nodes = useAppStore((state) => state.nodes);
   const edges = useAppStore((state) => state.edges);
-  const controlsRef = useRef<any>(null);
+  const controlsRef = useRef<OrbitControlsImpl>(null);
   const simNodesRefForCamera = useRef<SimNode[]>([]);
 
   return (
