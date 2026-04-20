@@ -20,9 +20,17 @@ import { fetchModelPolicy, chooseLlmModel } from '@/lib/llm-api';
 
 const MIN_SCREEN_WIDTH = 1200;
 const DEFAULT_MAX_PDF_SIZE_MB = 0;
+const DEFAULT_MAX_TOKENS = 512;
+const MAX_TOKENS_LIMIT = 8192;
+const API_HOST_STORAGE_KEY = 'cog-cart-api-host';
+const MAX_TOKENS_STORAGE_KEY = 'cog-cart-max-tokens';
 
 function formatMegabytes(value: number): string {
   return Number.isInteger(value) ? String(value) : value.toFixed(1);
+}
+
+function normalizeMaxTokens(value: unknown, fallback = DEFAULT_MAX_TOKENS): number {
+  return Math.min(MAX_TOKENS_LIMIT, Math.max(1, toPositiveInt(value, fallback)));
 }
 
 interface QuerySource {
@@ -1089,7 +1097,8 @@ export default function App() {
   const [queryText, setQueryText] = useState('');
   const [aiQuery, setAiQuery] = useState('');
   const [aiK, setAiK] = useState(10);
-  const [maxTokens, setMaxTokens] = useState(200);
+  const [maxTokens, setMaxTokens] = useState(DEFAULT_MAX_TOKENS);
+  const [maxTokensInput, setMaxTokensInput] = useState(String(DEFAULT_MAX_TOKENS));
   const [isAttentionPopoverOpen, setIsAttentionPopoverOpen] = useState(false);
   const [attentionViewMode, setAttentionViewMode] = useState<'stack' | 'layer' | 'single'>('stack');
   const [selectedLayerIndex, setSelectedLayerIndex] = useState(0);
@@ -1145,6 +1154,13 @@ export default function App() {
     originY: 0,
   });
   const { nodes, edges, isLoading, setLoading, setActiveNodes, setAiSourceNodes, selectedNodeId, setSelectedNode, loadGraph, sessionId, setSessionId, setUploadSocket } = useAppStore();
+
+  const commitMaxTokensInput = useCallback((value = maxTokensInput) => {
+    const nextMaxTokens = normalizeMaxTokens(value, maxTokens);
+    setMaxTokens(nextMaxTokens);
+    setMaxTokensInput(String(nextMaxTokens));
+    return nextMaxTokens;
+  }, [maxTokens, maxTokensInput]);
 
   const pinSourceNodes = useCallback((sources: QuerySource[]) => {
     const { nodes: currentNodes, edges: currentEdges } = useAppStore.getState();
@@ -1304,13 +1320,15 @@ export default function App() {
     }
   }, [isAnalyzing, analysisPrompt]);
 
-  const handleAiQuery = useCallback(() => {
+  const handleAiQuery = useCallback((maxTokensOverride?: number) => {
     if (!aiQuery.trim() || isQuerying) return;
 
     if (!apiHost) {
       setAiAnswer('API host is not configured. Set it in the setup screen.');
       return;
     }
+
+    const resolvedMaxTokens = normalizeMaxTokens(maxTokensOverride, maxTokens);
 
     if (wsRef.current) {
       wsRef.current.close();
@@ -1353,7 +1371,7 @@ export default function App() {
 
     ws.onopen = () => {
       setAttentionStatus('Connected. Streaming attention heads...');
-      ws.send(JSON.stringify({ query: aiQuery.trim(), k: aiK, max_tokens: maxTokens, session_id: useAppStore.getState().sessionId }));
+      ws.send(JSON.stringify({ query: aiQuery.trim(), k: aiK, max_tokens: resolvedMaxTokens, session_id: useAppStore.getState().sessionId }));
     };
 
     ws.onmessage = (event) => {
@@ -1877,11 +1895,19 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    const saved = localStorage.getItem('cog-cart-api-host') || '';
-    setApiHost(saved);
-    setApiHostInput(saved);
+    const savedApiHost = localStorage.getItem(API_HOST_STORAGE_KEY) || '';
+    const savedMaxTokens = normalizeMaxTokens(localStorage.getItem(MAX_TOKENS_STORAGE_KEY), DEFAULT_MAX_TOKENS);
+    setApiHost(savedApiHost);
+    setApiHostInput(savedApiHost);
+    setMaxTokens(savedMaxTokens);
+    setMaxTokensInput(String(savedMaxTokens));
     setMounted(true);
   }, []);
+
+  useEffect(() => {
+    if (!mounted) return;
+    localStorage.setItem(MAX_TOKENS_STORAGE_KEY, String(maxTokens));
+  }, [mounted, maxTokens]);
 
   useEffect(() => {
     void fetchAvailableModels();
@@ -1967,7 +1993,7 @@ export default function App() {
                   e.preventDefault();
                   const trimmed = apiHostInput.trim().replace(/^https?:\/\//, '').replace(/\/+$/, '');
                   if (!trimmed) return;
-                  localStorage.setItem('cog-cart-api-host', trimmed);
+                  localStorage.setItem(API_HOST_STORAGE_KEY, trimmed);
                   setApiHost(trimmed);
                 }}
               >
@@ -2075,7 +2101,7 @@ export default function App() {
                       type="button"
                       className="shrink-0 text-[10px] text-muted-foreground/60 underline hover:text-white/80 transition-colors"
                       onClick={() => {
-                        localStorage.removeItem('cog-cart-api-host');
+                        localStorage.removeItem(API_HOST_STORAGE_KEY);
                         setApiHost('');
                         setApiHostInput('');
                       }}
@@ -2322,7 +2348,8 @@ export default function App() {
                   className="flex items-start gap-2"
                   onSubmit={(e) => {
                     e.preventDefault();
-                    handleAiQuery();
+                    const resolvedMaxTokens = commitMaxTokensInput();
+                    handleAiQuery(resolvedMaxTokens);
                   }}
                 >
                   <div className="flex flex-col gap-2">
@@ -2427,6 +2454,25 @@ export default function App() {
                           else if (Array.isArray(val) && typeof val[0] === 'number') setAiK(val[0]);
                         }}
                       />
+                    </div>
+
+                    <div className="flex items-center gap-2">
+                      <span className="shrink-0 text-xs text-muted-foreground">max tokens:</span>
+                      <Input
+                        type="number"
+                        inputMode="numeric"
+                        min={1}
+                        max={MAX_TOKENS_LIMIT}
+                        step={1}
+                        value={maxTokensInput}
+                        disabled={isQuerying || isSwitchingModel}
+                        onChange={(e) => setMaxTokensInput(e.target.value.replace(/\D/g, ''))}
+                        onBlur={() => {
+                          commitMaxTokensInput();
+                        }}
+                        className="h-7 w-24 border-white/10 bg-black/50 text-xs text-white placeholder:text-white/35"
+                      />
+                      <span className="text-[11px] text-muted-foreground">1-{MAX_TOKENS_LIMIT}</span>
                     </div>
 
                     <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
