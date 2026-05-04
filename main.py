@@ -2,6 +2,7 @@ import os
 import asyncio
 import tempfile
 import uuid
+import gc
 from dotenv import load_dotenv
 from pydantic import BaseModel
 import fitz
@@ -114,23 +115,47 @@ async def _safe_send_json(websocket: WebSocket, payload: dict) -> bool:
 
 
 model_list, model_id_local = _load_model_config(MODEL_CONFIG_PATH, DEFAULT_MODEL_LIST)
-device = (
-    "cuda" if torch.cuda.is_available()
-    else "mps" if torch.backends.mps.is_available()
-    else "xpu" if hasattr(torch, "xpu") and torch.xpu.is_available()
-    else "cpu"
-)
+
+
+def _select_device() -> str:
+    return (
+        "cuda" if torch.cuda.is_available()
+        else "mps" if torch.backends.mps.is_available()
+        else "xpu" if hasattr(torch, "xpu") and torch.xpu.is_available()
+        else "cpu"
+    )
+
+
+device = _select_device()
+
+
 def _select_torch_dtype(selected_device: str) -> torch.dtype:
     if selected_device in {"cuda", "mps", "xpu"}:
         return torch.float16
     return torch.float32
 
-tokenizer = AutoTokenizer.from_pretrained(model_id_local)
-local_model = AutoModelForCausalLM.from_pretrained(
-    model_id_local,
-    torch_dtype=_select_torch_dtype(device),
-    attn_implementation="eager",
-).to(device)
+
+def _clear_torch_cache(selected_device: str) -> None:
+    if selected_device == "cuda" and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    elif selected_device == "mps" and hasattr(torch, "mps") and torch.backends.mps.is_available():
+        torch.mps.empty_cache()
+    elif selected_device == "xpu" and hasattr(torch, "xpu") and torch.xpu.is_available():
+        torch.xpu.empty_cache()
+
+
+def _load_local_llm(model_name: str, selected_device: str):
+    loaded_tokenizer = AutoTokenizer.from_pretrained(model_name)
+    loaded_model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        torch_dtype=_select_torch_dtype(selected_device),
+        attn_implementation="eager",
+    ).to(selected_device)
+    return loaded_tokenizer, loaded_model
+
+
+tokenizer, local_model = _load_local_llm(model_id_local, device)
+_model_swap_lock = asyncio.Lock()
 
 app = FastAPI()
 
@@ -208,15 +233,32 @@ async def choose_llm(model: ModelWanted):
             status_code=403,
             detail="Custom Hugging Face models are disabled on this server.",
         )
-    model_id_local = model.model_name
-    device = "mps" if torch.backends.mps.is_available() else "cpu"
-    tokenizer = AutoTokenizer.from_pretrained(model_id_local)
-    local_model = AutoModelForCausalLM.from_pretrained(
-        model_id_local,
-        torch_dtype=_select_torch_dtype(device),
-        attn_implementation="eager",
-    ).to(device)
-    return {"status": "ok"}
+
+    async with _model_swap_lock:
+        new_device = _select_device()
+        try:
+            new_tokenizer, new_model = _load_local_llm(model.model_name, new_device)
+        except Exception as e:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to load model '{model.model_name}': {e}",
+            )
+
+        old_model = local_model
+        old_tokenizer = tokenizer
+        old_device = device
+
+        model_id_local = model.model_name
+        device = new_device
+        tokenizer = new_tokenizer
+        local_model = new_model
+
+        del old_model
+        del old_tokenizer
+        gc.collect()
+        _clear_torch_cache(old_device)
+
+    return {"status": "ok", "model": model_id_local, "device": device}
 
 
 @app.get("/health/model")
@@ -434,18 +476,18 @@ async def websocket_upload(websocket: WebSocket):
 MAX_NEW_TOKENS = 10
 
 
-def generate_with_attention(input_ids, max_new_tokens, queue, loop):
-    eos_token_id = tokenizer.eos_token_id
+def generate_with_attention(input_ids, max_new_tokens, model, tok, queue, loop):
+    eos_token_id = tok.eos_token_id
     current_ids = input_ids
 
     try:
         with torch.no_grad():
             for step in range(max_new_tokens):
-                outputs = local_model(current_ids, output_attentions=True)
+                outputs = model(current_ids, output_attentions=True)
 
                 logits = outputs.logits[:, -1, :]
                 next_token_id = logits.argmax(dim=-1, keepdim=True)
-                next_token_str = tokenizer.decode(next_token_id[0], skip_special_tokens=False)
+                next_token_str = tok.decode(next_token_id[0], skip_special_tokens=False)
 
                 seq_len = current_ids.shape[1]
                 start = max(0, seq_len - MAX_SEQ_LEN)
@@ -456,7 +498,7 @@ def generate_with_attention(input_ids, max_new_tokens, queue, loop):
                     attention_grid.append(sliced.cpu().tolist())
 
                 visible_ids = current_ids[0, start:]
-                visible_tokens = tokenizer.convert_ids_to_tokens(visible_ids)
+                visible_tokens = tok.convert_ids_to_tokens(visible_ids)
 
                 asyncio.run_coroutine_threadsafe(
                     queue.put({
@@ -505,6 +547,12 @@ async def websocket_attention(websocket: WebSocket):
             k = data.get("k", 5)
             max_tokens = data.get("max_tokens", MAX_NEW_TOKENS)
 
+            async with _model_swap_lock:
+                active_model = local_model
+                active_tokenizer = tokenizer
+                active_device = device
+                active_model_id = model_id_local
+
             docs = vectorstore.similarity_search(query, k=k)
             context = "\n\n".join([doc.page_content for doc in docs])
             source_chat_ids = [doc.metadata["chat_id"] for doc in docs]
@@ -545,17 +593,17 @@ async def websocket_attention(websocket: WebSocket):
 
             try:
                 msgs = [{"role": "user", "content": f"{context}\n\n{query}"}]
-                input_ids = tokenizer.apply_chat_template(msgs, return_tensors="pt")
+                input_ids = active_tokenizer.apply_chat_template(msgs, return_tensors="pt")
                 if not isinstance(input_ids, torch.Tensor):
                     input_ids = input_ids["input_ids"]
                 if input_ids.dim() == 1:
                     input_ids = input_ids.unsqueeze(0)
-                input_ids = input_ids[:, :MAX_SEQ_LEN].to(device)
+                input_ids = input_ids[:, :MAX_SEQ_LEN].to(active_device)
 
-                num_layers = len(local_model.model.layers)
-                num_heads = local_model.config.num_attention_heads
+                num_layers = len(active_model.model.layers)
+                num_heads = active_model.config.num_attention_heads
 
-                prompt_tokens = tokenizer.convert_ids_to_tokens(input_ids[0])
+                prompt_tokens = active_tokenizer.convert_ids_to_tokens(input_ids[0])
                 if not await _safe_send_json(
                     websocket,
                     {
@@ -571,7 +619,16 @@ async def websocket_attention(websocket: WebSocket):
 
                 queue = asyncio.Queue()
                 loop = asyncio.get_running_loop()
-                loop.run_in_executor(None, generate_with_attention, input_ids, max_tokens, queue, loop)
+                loop.run_in_executor(
+                    None,
+                    generate_with_attention,
+                    input_ids,
+                    max_tokens,
+                    active_model,
+                    active_tokenizer,
+                    queue,
+                    loop,
+                )
 
                 full_answer = []
                 generation_error = None
@@ -619,20 +676,20 @@ async def websocket_attention(websocket: WebSocket):
                             "role": "user",
                             "content": f"Rewrite the following text clearly and concisely in plain English. Do not add any new information, just clean up the formatting:\n\n{raw_answer}",
                         }]
-                        reformat_ids = tokenizer.apply_chat_template(reformat_msgs, return_tensors="pt")
+                        reformat_ids = active_tokenizer.apply_chat_template(reformat_msgs, return_tensors="pt")
                         if not isinstance(reformat_ids, torch.Tensor):
                             reformat_ids = reformat_ids["input_ids"]
                         if reformat_ids.dim() == 1:
                             reformat_ids = reformat_ids.unsqueeze(0)
-                        reformat_ids = reformat_ids.to(device)
+                        reformat_ids = reformat_ids.to(active_device)
 
                         def _generate_reformat():
                             with torch.no_grad():
-                                return local_model.generate(reformat_ids, max_new_tokens=300)
+                                return active_model.generate(reformat_ids, max_new_tokens=300)
 
                         reformat_out = await loop.run_in_executor(None, _generate_reformat)
                         clean_tokens = reformat_out[0, reformat_ids.shape[1]:]
-                        clean_answer = tokenizer.decode(clean_tokens, skip_special_tokens=True).strip()
+                        clean_answer = active_tokenizer.decode(clean_tokens, skip_special_tokens=True).strip()
                     except Exception as e:
                         await _safe_send_json(
                             websocket,
@@ -646,6 +703,7 @@ async def websocket_attention(websocket: WebSocket):
                         "data": {
                             "query": query,
                             "answer": clean_answer,
+                            "model": active_model_id,
                             "sources": [
                                 {"text": doc.page_content, "metadata": doc.metadata}
                                 for doc in docs
